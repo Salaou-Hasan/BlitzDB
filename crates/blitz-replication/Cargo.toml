@@ -1,0 +1,13 @@
+[package]
+name = "blitz-replication"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Replication engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

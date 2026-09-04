@@ -1,0 +1,17 @@
+[package]
+name = "blitz-tx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Transaction engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+blitz-table = { path = "../blitz-table" }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]

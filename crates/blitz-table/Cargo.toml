@@ -1,0 +1,16 @@
+[package]
+name = "blitz-table"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Table storage engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+blitz-memory = { path = "../blitz-memory" }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

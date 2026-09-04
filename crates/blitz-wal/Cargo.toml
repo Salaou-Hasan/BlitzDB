@@ -1,0 +1,19 @@
+[package]
+name = "blitz-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Write-ahead log for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+bytes = { workspace = true }
+blake3 = { workspace = true }
+serde = { workspace = true }
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,16 @@
+[package]
+name = "blitz-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core data types for BlitzDB"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]

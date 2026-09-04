@@ -1,0 +1,91 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/blitz-types",
+    "crates/blitz-core",
+    "crates/blitz-memory",
+    "crates/blitz-table",
+    "crates/blitz-index",
+    "crates/blitz-query",
+    "crates/blitz-tx",
+    "crates/blitz-storage",
+    "crates/blitz-wal",
+    "crates/blitz-snapshot",
+    "crates/blitz-runtime",
+    "crates/blitz-auth",
+    "crates/blitz-policy",
+    "crates/blitz-events",
+    "crates/blitz-realtime",
+    "crates/blitz-api",
+    "crates/blitz-protocol",
+    "crates/blitz-search",
+    "crates/blitz-jobs",
+    "crates/blitz-replication",
+    "crates/blitz-cluster",
+    "crates/blitz-observability",
+    "crates/blitz-cli",
+    "crates/blitz-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Salaou-Hasan/BlitzDB"
+authors = ["Salaou-Hasan"]
+description = "BlitzDB - A general-purpose high-performance application database/runtime"
+
+[workspace.dependencies]
+# Core async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hashing and crypto
+blake3 = "1"
+sha2 = "0.10"
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Async utilities
+futures = "0.3"
+pin-project-lite = "0.2"
+
+# Collections
+hashbrown = "0.15"
+bytes = "1"
+
+# Macros
+paste = "1"
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Testing
+tempfile = "3"
+assert_matches = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true

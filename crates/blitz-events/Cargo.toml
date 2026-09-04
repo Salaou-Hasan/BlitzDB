@@ -1,0 +1,18 @@
+[package]
+name = "blitz-events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Event engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]

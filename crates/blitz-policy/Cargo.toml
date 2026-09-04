@@ -1,0 +1,14 @@
+[package]
+name = "blitz-policy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authorization policy engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-auth = { path = "../blitz-auth" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

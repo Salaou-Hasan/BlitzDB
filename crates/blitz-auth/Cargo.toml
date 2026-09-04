@@ -1,0 +1,15 @@
+[package]
+name = "blitz-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Authentication engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

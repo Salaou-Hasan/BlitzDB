@@ -1,0 +1,15 @@
+[package]
+name = "blitz-memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Memory-resident storage engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

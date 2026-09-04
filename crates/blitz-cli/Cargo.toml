@@ -1,0 +1,21 @@
+[package]
+name = "blitz-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI tool for BlitzDB"
+
+[[bin]]
+name = "Blitz"
+path = "src/main.rs"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-server = { path = "../blitz-server" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]

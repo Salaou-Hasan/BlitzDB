@@ -1,0 +1,15 @@
+[package]
+name = "blitz-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Index engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

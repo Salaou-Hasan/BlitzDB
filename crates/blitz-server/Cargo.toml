@@ -1,0 +1,32 @@
+[package]
+name = "blitz-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Server entry point for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+blitz-memory = { path = "../blitz-memory" }
+blitz-table = { path = "../blitz-table" }
+blitz-index = { path = "../blitz-index" }
+blitz-query = { path = "../blitz-query" }
+blitz-tx = { path = "../blitz-tx" }
+blitz-storage = { path = "../blitz-storage" }
+blitz-wal = { path = "../blitz-wal" }
+blitz-snapshot = { path = "../blitz-snapshot" }
+blitz-runtime = { path = "../blitz-runtime" }
+blitz-auth = { path = "../blitz-auth" }
+blitz-policy = { path = "../blitz-policy" }
+blitz-events = { path = "../blitz-events" }
+blitz-realtime = { path = "../blitz-realtime" }
+blitz-api = { path = "../blitz-api" }
+blitz-protocol = { path = "../blitz-protocol" }
+blitz-observability = { path = "../blitz-observability" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]

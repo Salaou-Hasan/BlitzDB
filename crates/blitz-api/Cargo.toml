@@ -1,0 +1,17 @@
+[package]
+name = "blitz-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "API layer for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+blitz-tx = { path = "../blitz-tx" }
+blitz-auth = { path = "../blitz-auth" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]

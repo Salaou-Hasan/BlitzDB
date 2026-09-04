@@ -1,0 +1,15 @@
+[package]
+name = "blitz-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Query engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+blitz-table = { path = "../blitz-table" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

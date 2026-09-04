@@ -1,0 +1,17 @@
+[package]
+name = "blitz-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Application runtime for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+blitz-tx = { path = "../blitz-tx" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]

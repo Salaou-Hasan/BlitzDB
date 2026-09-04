@@ -1,0 +1,16 @@
+[package]
+name = "blitz-jobs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Background job system for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]

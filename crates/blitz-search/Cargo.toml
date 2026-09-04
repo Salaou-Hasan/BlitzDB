@@ -1,0 +1,13 @@
+[package]
+name = "blitz-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Full-text search engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

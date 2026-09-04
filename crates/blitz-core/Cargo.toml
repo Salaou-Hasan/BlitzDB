@@ -1,0 +1,15 @@
+[package]
+name = "blitz-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core database engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+thiserror = { workspace = true }
+hashbrown = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

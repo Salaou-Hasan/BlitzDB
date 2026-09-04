@@ -1,0 +1,18 @@
+[package]
+name = "blitz-realtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Realtime subscription engine for BlitzDB"
+
+[dependencies]
+blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
+blitz-events = { path = "../blitz-events" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
