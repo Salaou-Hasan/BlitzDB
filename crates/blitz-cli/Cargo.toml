@@ -11,11 +11,15 @@ path = "src/main.rs"
 
 [dependencies]
 blitz-types = { path = "../blitz-types" }
+blitz-core = { path = "../blitz-core" }
 blitz-server = { path = "../blitz-server" }
 thiserror = { workspace = true }
+clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]

@@ -1,3 +1,3 @@
 pub mod server;
 
-pub use server::BlitzServer;
+pub use server::{BlitzServer, ServerConfig};
