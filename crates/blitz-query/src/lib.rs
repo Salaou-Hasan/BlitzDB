@@ -1,7 +1,7 @@
-pub mod planner;
-pub mod executor;
 pub mod error;
+pub mod executor;
+pub mod planner;
 
-pub use planner::QueryPlanner;
-pub use executor::QueryExecutor;
 pub use error::{QueryError, QueryResult};
+pub use executor::QueryExecutor;
+pub use planner::{AggFunction, Filter, Query, Sort, SortDirection};
