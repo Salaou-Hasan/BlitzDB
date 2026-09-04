@@ -4,6 +4,8 @@ use thiserror::Error;
 pub enum RealtimeError {
     #[error("subscription error: {0}")]
     SubscriptionError(String),
+    #[error("channel closed")]
+    ChannelClosed,
     #[error("internal error: {0}")]
     Internal(String),
 }

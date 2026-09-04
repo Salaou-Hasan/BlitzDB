@@ -1,7 +1,7 @@
-pub mod event;
 pub mod emitter;
 pub mod error;
+pub mod event;
 
-pub use event::Event;
 pub use emitter::EventEmitter;
 pub use error::{EventError, EventResult};
+pub use event::{Event, EventKind};
