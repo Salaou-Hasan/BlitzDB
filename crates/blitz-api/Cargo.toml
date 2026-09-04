@@ -13,5 +13,6 @@ blitz-auth = { path = "../blitz-auth" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]

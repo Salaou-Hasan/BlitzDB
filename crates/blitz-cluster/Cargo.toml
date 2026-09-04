@@ -9,5 +9,7 @@ description = "Cluster coordination for BlitzDB"
 blitz-types = { path = "../blitz-types" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
