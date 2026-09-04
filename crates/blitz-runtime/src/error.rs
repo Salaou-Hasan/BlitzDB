@@ -6,6 +6,8 @@ pub enum RuntimeError {
     FunctionNotFound(String),
     #[error("execution error: {0}")]
     ExecutionError(String),
+    #[error("argument error: {0}")]
+    ArgumentError(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
