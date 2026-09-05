@@ -12,5 +12,7 @@ tracing = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+wasmtime = "=21.0.2"
 
 [dev-dependencies]
+wat = "=1.251.0"

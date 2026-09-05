@@ -78,7 +78,11 @@ procedure, plus bench isolation per `ccu-N` subdir.
 ## What is NOT on the hot path (by design)
 
 - `blitz-tx` interactive tx, `blitz-query` planner, `blitz-search` crate TF
-  index, `blitz-jobs`, replication/cluster (Stage 9+ stubs).
+  index, replication/cluster (Stage 9+ stubs).
+- `blitz-jobs` WASM executor (Wasmtime, fuel + memory capped, no host
+  imports in v1): pure-compute guests over string in/out (`run` + `memory`
+  contract), precompiled engines shared per process, run on blocking pools
+  — never inline in dispatch. TCP submit/status ops are future work.
 - Per-request full-sort timelines: cursor `Scan` exists for admin/backfill
   pages only; production feeds are precomputed (fanout worker) or pulled
   point reads. Hotspot ping-pong 50/50-update at 50K is syscall-bound
