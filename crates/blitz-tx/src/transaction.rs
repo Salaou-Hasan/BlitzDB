@@ -42,12 +42,12 @@ pub struct Transaction {
     pub isolation: IsolationLevel,
     /// Buffered write operations.
     pub writes: Vec<WriteOp>,
-    /// Read set for conflict detection.
-    pub read_set: Vec<(String, RowId)>,
-    /// Snapshot of data at transaction start.
-    snapshot: HashMap<String, HashMap<RowId, Row>>,
+    /// Read set for conflict detection: (table, row, version observed).
+    pub read_set: Vec<(String, RowId, u64)>,
+    /// Commit sequence observed when the transaction began.
+    /// A buffered Update/Delete conflicts if the row was written by a newer commit.
+    pub start_seq: u64,
 }
-
 impl Transaction {
     pub fn new(id: TransactionId, isolation: IsolationLevel) -> Self {
         Self {
@@ -56,7 +56,7 @@ impl Transaction {
             isolation,
             writes: Vec::new(),
             read_set: Vec::new(),
-            snapshot: HashMap::new(),
+            start_seq: 0,
         }
     }
 
@@ -114,9 +114,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Record a read for conflict detection.
-    pub fn record_read(&mut self, table: impl Into<String>, id: RowId) {
-        self.read_set.push((table.into(), id));
+    /// Record a read for conflict detection, with the version observed.
+    pub fn record_read(&mut self, table: impl Into<String>, id: RowId, version: u64) {
+        self.read_set.push((table.into(), id, version));
     }
 
     /// Mark the transaction as committed.

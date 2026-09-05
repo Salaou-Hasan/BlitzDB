@@ -19,6 +19,7 @@ pub struct Row {
 
 impl Row {
     /// Create a new row with the given ID.
+    #[inline]
     pub fn new(id: RowId) -> Self {
         Self {
             id,
@@ -32,21 +33,25 @@ impl Row {
     }
 
     /// Set a column value on this row.
+    #[inline]
     pub fn set(&mut self, name: impl Into<String>, value: Value) {
         self.values.insert(name.into(), value);
     }
 
     /// Get a column value from this row.
+    #[inline]
     pub fn get(&self, name: &str) -> Option<&Value> {
         self.values.get(name)
     }
 
     /// Get a mutable reference to a column value.
+    #[inline]
     pub fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
         self.values.get_mut(name)
     }
 
     /// Check if a column exists.
+    #[inline]
     pub fn has_column(&self, name: &str) -> bool {
         self.values.contains_key(name)
     }
@@ -57,11 +62,13 @@ impl Row {
     }
 
     /// Get the number of columns in this row.
+    #[inline]
     pub fn len(&self) -> usize {
         self.values.len()
     }
 
     /// Check if the row has no columns.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }

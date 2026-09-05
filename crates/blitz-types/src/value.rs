@@ -178,6 +178,7 @@ impl Hash for Value {
 
 impl Value {
     /// Returns true if this value is null.
+    #[inline]
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
@@ -209,6 +210,7 @@ impl Value {
     }
 
     /// Attempt to convert this value to an i64.
+    #[inline]
     pub fn as_i64(&self) -> Option<i64> {
         match self {
             Value::Int8(v) => Some(*v as i64),
@@ -223,6 +225,7 @@ impl Value {
     }
 
     /// Attempt to convert this value to a u64.
+    #[inline]
     pub fn as_u64(&self) -> Option<u64> {
         match self {
             Value::UInt8(v) => Some(*v as u64),
@@ -238,6 +241,7 @@ impl Value {
     }
 
     /// Attempt to convert this value to an f64.
+    #[inline]
     pub fn as_f64(&self) -> Option<f64> {
         match self {
             Value::Float32(v) => Some(*v as f64),
@@ -255,6 +259,7 @@ impl Value {
     }
 
     /// Attempt to convert this value to a string reference.
+    #[inline]
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Value::String(s) => Some(s),
@@ -263,6 +268,7 @@ impl Value {
     }
 
     /// Attempt to convert this value to a bool.
+    #[inline]
     pub fn as_bool(&self) -> Option<bool> {
         match self {
             Value::Boolean(v) => Some(*v),

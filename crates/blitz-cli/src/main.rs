@@ -87,13 +87,12 @@ async fn main() -> Result<()> {
             };
 
             let mut server = BlitzServer::with_config(config);
-            server.start()?;
+            server.start().await?;
 
             println!("BlitzDB server listening on {}:{}", host, port);
             println!("Press Ctrl+C to shutdown");
 
             tokio::signal::ctrl_c().await?;
-            server.shutdown();
             println!("Server shutdown complete");
         }
 
@@ -110,7 +109,7 @@ async fn main() -> Result<()> {
 
         Commands::Query { sql, format } => {
             let mut server = BlitzServer::new();
-            server.start()?;
+            server.start().await?;
 
             println!("Query: {}", sql);
             println!("Format: {}", format);
@@ -138,7 +137,7 @@ async fn main() -> Result<()> {
 
         Commands::Metrics => {
             let mut server = BlitzServer::new();
-            server.start()?;
+            server.start().await?;
             println!("Metrics:");
             println!("  uptime:     0s (just started)");
             println!("  tables:     2");

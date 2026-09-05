@@ -88,7 +88,7 @@ impl RecoveryManager {
 
     /// Restore engine state from a snapshot.
     fn restore_snapshot(&self, snapshot: Snapshot) -> RecoveryResult<InMemoryTableEngine> {
-        let mut engine = InMemoryTableEngine::new();
+        let engine = InMemoryTableEngine::new();
 
         for table_data in &snapshot.tables {
             // Create table

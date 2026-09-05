@@ -17,7 +17,7 @@ pub struct Table {
 impl Table {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
-        let mut engine = InMemoryTableEngine::new();
+        let engine = InMemoryTableEngine::new();
         let schema = TableSchema::new(name.clone());
         engine.create_table(schema).unwrap();
         Self { engine, name }
@@ -25,7 +25,7 @@ impl Table {
 
     pub fn with_schema(schema: TableSchema) -> Self {
         let name = schema.name.clone();
-        let mut engine = InMemoryTableEngine::new();
+        let engine = InMemoryTableEngine::new();
         engine.create_table(schema).unwrap();
         Self { engine, name }
     }
@@ -60,7 +60,7 @@ impl Table {
         self.engine.count(&self.name).map_err(TableError::from)
     }
 
-    pub fn schema(&self) -> TableResult<&TableSchema> {
+    pub fn schema(&self) -> TableResult<TableSchema> {
         self.engine.schema(&self.name).map_err(TableError::from)
     }
 }

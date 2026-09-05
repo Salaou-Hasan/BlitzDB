@@ -11,6 +11,7 @@ use crate::error::TypeError;
 pub struct TableId(pub Uuid);
 
 impl TableId {
+    #[inline]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -50,14 +51,17 @@ impl FromStr for TableId {
 pub struct RowId(pub u64);
 
 impl RowId {
+    #[inline]
     pub fn new(id: u64) -> Self {
         Self(id)
     }
 
+    #[inline]
     pub fn as_u64(&self) -> u64 {
         self.0
     }
 
+    #[inline]
     pub fn next(&self) -> Self {
         Self(self.0 + 1)
     }
@@ -80,6 +84,7 @@ impl From<u64> for RowId {
 pub struct IndexId(pub Uuid);
 
 impl IndexId {
+    #[inline]
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -106,10 +111,12 @@ impl fmt::Display for IndexId {
 pub struct TransactionId(pub u64);
 
 impl TransactionId {
+    #[inline]
     pub fn new(id: u64) -> Self {
         Self(id)
     }
 
+    #[inline]
     pub fn as_u64(&self) -> u64 {
         self.0
     }

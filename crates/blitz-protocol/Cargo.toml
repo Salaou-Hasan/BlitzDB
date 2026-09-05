@@ -9,7 +9,8 @@ description = "Wire protocol for BlitzDB"
 blitz-types = { path = "../blitz-types" }
 thiserror = { workspace = true }
 bytes = { workspace = true }
-serde = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
