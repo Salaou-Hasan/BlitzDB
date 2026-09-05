@@ -2740,6 +2740,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_index_rebuilt_after_loss() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        server
+            .engine()
+            .create_table(
+                blitz_types::schema::TableSchema::new("posts")
+                    .with_column(blitz_types::column::ColumnDef::new("id", blitz_types::column::ColumnType::Int64).nullable())
+                    .with_column(blitz_types::column::ColumnDef::new("author", blitz_types::column::ColumnType::String).nullable())
+                    .with_column(blitz_types::column::ColumnDef::new("body", blitz_types::column::ColumnType::String).nullable()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        for (i, body) in ["alpha bravo", "bravo charlie"].iter().enumerate() {
+            let r = client
+                .roundtrip(&Request {
+                    id: i as u64,
+                    op: Op::Insert,
+                    table: "posts".into(),
+                    row_id: None,
+                    values: Some(values(&[
+                        ("author", Value::String("a".into())),
+                        ("body", Value::String((*body).into())),
+                    ])),
+                })
+                .await
+                .unwrap();
+            assert!(r.ok, "insert failed: {:?}", r.error);
+        }
+        let search = |id: u64, q: &str| Request {
+            id,
+            op: Op::Search,
+            table: "posts".into(),
+            row_id: None,
+            values: Some(values(&[
+                ("_q", Value::String(q.into())),
+                ("_limit", Value::Int64(20)),
+            ])),
+        };
+        // Live index works.
+        let r = client.roundtrip(&search(10, "alpha")).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        // Simulate restart: drop all postings → search goes blind.
+        server.clear_search_index();
+        let r = client.roundtrip(&search(11, "alpha")).await.unwrap();
+        assert!(r.ok && r.rows.is_empty(), "index should be blind after loss: {:?}", r);
+        // Boot repair: rebuild from posts tables → search works again.
+        assert_eq!(server.rebuild_search_index(), 2);
+        let r = client.roundtrip(&search(12, "alpha")).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        let r = client.roundtrip(&search(13, "bravo")).await.unwrap();
+        assert!(r.ok && r.rows.len() == 2, "got {:?}", r);
+    }
+
+    #[tokio::test]
     async fn test_media_blob_cap() {
         let server = Arc::new(BlitzServer::new());
         server.start().await.unwrap();

@@ -6,8 +6,8 @@
 //!   falls back to pull (`Get`/cursor-`Scan`); true fanout-out is Stage 9+.
 //! - Exact-term bounded search index over post bodies (8 terms/post,
 //!   128/posting). No TF-IDF/ranking — Stage 9+.
-//! - Derived `timeline` rows skip WAL (recomputable cache); snapshots still
-//!   capture them like any table.
+//! - Derived `timeline` rows are WAL-logged like any write (replay restores
+//!   them); snapshots capture them too. No silent second state.
 
 use std::sync::Arc;
 
@@ -121,14 +121,34 @@ pub fn run_fanout_loop(server: Arc<BlitzServer>, rx: std::sync::mpsc::Receiver<F
             .unwrap_or_default();
         let mut done = 0u64;
         for owner in owners {
+            let mut values = std::collections::HashMap::new();
+            values.insert("owner".to_string(), Value::String(owner));
+            values.insert("post".to_string(), Value::String(format!("{}:{}", job.table, job.row_id)));
+            values.insert("author".to_string(), Value::String(job.author.clone()));
+            values.insert("ts".to_string(), Value::String(ts.clone()));
+            let data = crate::durability::values_to_json_bytes(&values);
             let mut row = Row::new(RowId::new(0));
-            row.set("owner", Value::String(owner));
-            row.set("post", Value::String(format!("{}:{}", job.table, job.row_id)));
-            row.set("author", Value::String(job.author.clone()));
-            row.set("ts", Value::String(ts.clone()));
-            // Derived rows: validated insert, no WAL (recomputable).
-            if server.engine().insert("timeline", row).is_ok() {
-                done += 1;
+            for (k, v) in &values {
+                row.set(k.clone(), v.clone());
+            }
+            // Derived-but-durable: feed rows are WAL-logged so a crash
+            // can't silently diverge timelines from posts. Replay restores
+            // them (unknown tables get inferred schemas); postings stay
+            // bounded because fanout itself is capped per post.
+            match server.engine().insert("timeline", row) {
+                Ok(assigned) => {
+                    // Best-effort post-commit (worker context can't roll
+                    // back): failure bumps wal_dropped, row stays until
+                    // the next snapshot — same contract as atomic writes.
+                    let _ = server.wal_log(
+                        blitz_wal::EntryType::Insert,
+                        "timeline",
+                        assigned.as_u64(),
+                        data,
+                    );
+                    done += 1;
+                }
+                Err(_) => {}
             }
         }
         server.fanout_record_done(done);

@@ -887,9 +887,47 @@ impl BlitzServer {
             Event::new(EventKind::Custom("server.started".into())).with_table("system"),
         );
 
+        // Derived-state repair: the search index is memory-only, so a restart
+        // (or crash recovery) would silently un-index every old post. Rebuild
+        // it from `posts*` tables before serving. Offline at boot (not on the
+        // request path); caps re-apply naturally (recency approximate).
+        let indexed = self.rebuild_search_index();
+        tracing::info!("search index rebuilt: {} post bodies", indexed);
+
         *self.started_at.write().unwrap() = Some(chrono::Utc::now());
         tracing::info!("BlitzDB server started successfully");
         Ok(())
+    }
+
+    /// Re-tokenize every `posts*` row body into the search index. Returns the
+    /// number of bodies indexed. Idempotent (re-indexing refreshes postings).
+    pub fn rebuild_search_index(&self) -> usize {        let mut tables: Vec<String> = self
+            .engine
+            .table_names()
+            .into_iter()
+            .filter(|t| t == "posts" || t.starts_with("posts_"))
+            .collect();
+        tables.sort();
+        let mut n = 0usize;
+        for table in tables {
+            let rows = self.engine.scan_arcs(&table).unwrap_or_default();
+            for row in rows {
+                if let Some(Value::String(body)) = row.values.get("body") {
+                    self.index_post(&table, row.id.as_u64(), body);
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// Drop all postings (test-only): simulates the memory-only index loss
+    /// of a restart so tests can prove `rebuild_search_index` repairs it.
+    #[cfg(test)]
+    pub fn clear_search_index(&self) {
+        if let Ok(mut m) = self.search_index.write() {
+            m.clear();
+        }
     }
 
     /// Insert a row and emit events + notify subscribers.

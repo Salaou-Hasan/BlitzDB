@@ -49,9 +49,11 @@ Response encode (presized writer) → write → io/request/slow counters
   `_idem` (server dedups 256K bounded, in-memory RPO = group window).
 - Unique/PK enforced O(1) via maintained indexes (insert/check/update/delete/
   replay all maintain; delete frees). Concurrent dup claimants: exactly one wins.
-- Feed/search derived state: `timeline` rows skip WAL (recomputable);
-  snapshots capture everything; replay is idempotent (`insert_preserving_id`
-  + allocator bump; duplicate replays skipped).
+- Feed/search derived state: `timeline` rows are WAL-logged like any write
+  (replay restores them, unknown tables get inferred schemas); the memory-only
+  search index is rebuilt from `posts*` tables at boot (`rebuild_search_index`).
+  Snapshots capture everything; replay is idempotent (`insert_preserving_id`
+  + allocator bump; duplicate replays skipped). No silent second state.
 
 ## Durability modes
 

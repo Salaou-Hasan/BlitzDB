@@ -706,6 +706,40 @@ mod tests {
         assert!(e.get("t", RowId::new(1)).unwrap().is_some());
         assert!(e.get("t", RowId::new(2)).unwrap().is_some());
     }
+
+    #[test]
+    fn timeline_feed_rows_replay_without_schema() {
+        // Feed rows are derived-but-durable: the fanout worker WAL-logs them
+        // into a table that may not exist at replay time. Recovery must infer
+        // the schema and restore the rows (no silent feed divergence).
+        let dir = tmpdir("wal-timeline");
+        let d = dir.to_str().unwrap();
+        let mut b = WalBridge::open(d, DurabilityMode::near_sync()).unwrap();
+        for i in 1..=2u64 {
+            let mut m = std::collections::HashMap::new();
+            m.insert("owner".into(), Value::String("alice".into()));
+            m.insert("post".into(), Value::String(format!("posts:{}", 100 + i)));
+            m.insert("author".into(), Value::String("bob".into()));
+            m.insert("ts".into(), Value::String("1".into()));
+            b.append(PendingWrite {
+                entry: blitz_wal::EntryType::Insert,
+                table: "timeline".into(),
+                row_id: i,
+                data: values_to_json_bytes(&m),
+            })
+            .unwrap();
+        }
+        assert!(b.flush(Duration::from_secs(5)), "group-commit flush timed out");
+        b.shutdown();
+        // Fresh engine, no tables: replay infers `timeline` and restores rows.
+        let e = InMemoryTableEngine::new();
+        let (_, _, replayed) = recover(&e, d).unwrap();
+        assert!(replayed >= 2, "replayed={}", replayed);
+        for i in 1..=2u64 {
+            let row = e.get("timeline", RowId::new(i)).unwrap().expect("feed row lost");
+            assert_eq!(row.values.get("owner"), Some(&Value::String("alice".into())));
+        }
+    }
 }
 
 #[cfg(test)]
