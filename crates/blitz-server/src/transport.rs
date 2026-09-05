@@ -431,6 +431,8 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                 None => return Response::err(id, "find requires values {_col: String, _val: Value}"),
             };
             // Unique indexes are per-shard: probe each physical table.
+            // Missing SHARD tables probe on; an unknown BASE table errors.
+            let sharded = server.shard_count(&req.table) > 1;
             let mut hit: Option<(usize, std::sync::Arc<Row>)> = None;
             let mut find_err: Option<String> = None;
             for (shard, physical) in server.shard_tables(&req.table) {
@@ -444,7 +446,7 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                         // Fresh shard tables don't exist yet: probe on.
                         // Anything else (incl. non-unique column) is a
                         // real error.
-                        if e.to_string().contains("table not found") {
+                        if sharded && e.to_string().contains("table not found") {
                             continue;
                         }
                         find_err = Some(e.to_string());
@@ -1205,6 +1207,7 @@ fn scan_merged(
     server: &BlitzServer,
     base: &str,
 ) -> Result<Vec<(u64, std::sync::Arc<Row>)>, String> {
+    let sharded = server.shard_count(base) > 1;
     let mut merged: Vec<(u64, std::sync::Arc<Row>)> = Vec::new();
     for (shard, physical) in server.shard_tables(base) {
         match server.engine().scan_arcs(&physical) {
@@ -1214,7 +1217,9 @@ fn scan_merged(
                 }
             }
             Err(e) => {
-                if e.to_string().contains("table not found") {
+                // Fresh SHARD tables don't exist yet: skip. An unknown BASE
+                // table is a real error (callers rely on it).
+                if sharded && e.to_string().contains("table not found") {
                     continue;
                 }
                 return Err(e.to_string());
@@ -2843,6 +2848,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!g.ok, "deleted row must miss");
+        // Unknown base table still errors (fresh SHARD tables scan empty,
+        // unknown BASE tables do not).
+        let s = client
+            .roundtrip(&Request { id: 203, op: Op::Scan, table: "nope".into(), row_id: None, values: None })
+            .await
+            .unwrap();
+        assert!(!s.ok, "unknown table scan must err");
     }
 
     #[tokio::test]
