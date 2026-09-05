@@ -266,7 +266,7 @@ fn enforce_owner(
     server.authorize_row(authed, op, base, values.get(&col))
 }
 
-pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Request) -> Response {
+pub(crate) fn dispatch(server: &std::sync::Arc<BlitzServer>, authed: &Option<blitz_auth::Identity>, req: Request) -> Response {
     let id = req.id;
     match req.op {
         Op::Ping => Response::ok(id, Vec::new()),
@@ -630,7 +630,78 @@ pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identit
             Response::ok(id, rows)
         }
         Op::Call => execute_procedure(server, authed, req),
+        Op::JobSubmit => {
+            // values {wasm: Bytes, input: String, _type?: String, _retries?: Int}.
+            // Stores Pending + spawns the blocking-pool runner; responds at
+            // once with the job id (never inline — guests stay off dispatch).
+            let values = match req.values {
+                Some(v) => v,
+                None => return Response::err(id, "job_submit requires values {wasm: Bytes, input: String}"),
+            };
+            let wasm = match values.get("wasm") {
+                Some(Value::Bytes(b)) => b.clone(),
+                _ => return Response::err(id, "job_submit requires values {wasm: Bytes, input: String}"),
+            };
+            let input = match values.get("input") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return Response::err(id, "job_submit requires values {wasm: Bytes, input: String}"),
+            };
+            let label = match values.get("_type") {
+                Some(Value::String(s)) => s.clone(),
+                _ => "wasm".to_string(),
+            };
+            let mut job = blitz_jobs::Job::new(label);
+            if let Some(Value::Int64(n)) = values.get("_retries") {
+                job = job.with_max_retries((*n).clamp(0, 5) as u32);
+            }
+            let job_id = match server.store_wasm_job(job, wasm, input) {
+                Ok(jid) => jid,
+                Err(e) => return Response::err(id, e),
+            };
+            let runner = std::sync::Arc::clone(server);
+            let spawn_id = job_id.clone();
+            tokio::task::spawn_blocking(move || {
+                runner.run_wasm_job(&spawn_id);
+            });
+            let mut out = std::collections::HashMap::new();
+            out.insert("job_id".to_string(), Value::String(job_id));
+            out.insert("status".to_string(), Value::String("pending".to_string()));
+            Response::ok(id, vec![RowView { id: 0, values: out }])
+        }
+        Op::JobPoll => {
+            // values {_job: String id} -> {job_id, status, result?, error?}.
+            let job_id = match req.values.as_ref().and_then(|m| m.get("_job")) {
+                Some(Value::String(s)) => s.clone(),
+                _ => return Response::err(id, "job_poll requires values {_job: String}"),
+            };
+            match server.get_wasm_job(&job_id) {
+                Some(job) => {
+                    let mut out = std::collections::HashMap::new();
+                    out.insert("job_id".to_string(), Value::String(job_id));
+                    out.insert("status".to_string(), Value::String(job_status_name(&job.status)));
+                    if let Some(r) = job.result {
+                        out.insert("result".to_string(), Value::String(r));
+                    }
+                    if let Some(e) = job.error {
+                        out.insert("error".to_string(), Value::String(e));
+                    }
+                    Response::ok(id, vec![RowView { id: 0, values: out }])
+                }
+                None => Response::err(id, format!("job not found: {}", job_id)),
+            }
+        }
     }
+}
+
+fn job_status_name(status: &blitz_jobs::JobStatus) -> String {
+    match status {
+        blitz_jobs::JobStatus::Pending => "pending",
+        blitz_jobs::JobStatus::Running => "running",
+        blitz_jobs::JobStatus::Completed => "completed",
+        blitz_jobs::JobStatus::Failed => "failed",
+        blitz_jobs::JobStatus::Cancelled => "cancelled",
+    }
+    .to_string()
 }
 
 /// Atomic batch execution: all ops run in ONE OCC transaction
@@ -659,7 +730,7 @@ pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identit
 /// - `skip_validation` is NOT honored here (tx apply always validates):
 ///   atomic batches trade ~µs/op for the guarantee. Measured, not hidden.
 pub(crate) fn execute_atomic(
-    server: &BlitzServer,
+    server: &std::sync::Arc<BlitzServer>,
     authed: &mut Option<blitz_auth::Identity>,
     batch: BatchRequest,
 ) -> BatchResponse {
@@ -683,9 +754,10 @@ pub(crate) fn execute_atomic(
         if let Err(e) = server.authorize(authed, op.op, &op.table) {
             return abort_all(format!("atomic batch aborted: unauthorized op {}: {}", op.id, e));
         }
-        // Snapshot ops would read outside tx versioning, and nested Calls
-        // would nest transactions: reject, don't fake.
-        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call) {
+        // Snapshot ops would read outside tx versioning, nested Calls
+        // would nest transactions, and job ops spawn background work that
+        // can't roll back: reject, don't fake.
+        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll) {
             return abort_all(format!(
                 "atomic batch aborted: {:?} not supported in atomic batch",
                 op.op
@@ -872,7 +944,7 @@ pub(crate) fn execute_atomic(
                 let (shard, _) = BlitzServer::split_id(global);
                 buffered.push((rid, Buffered::Delete { base: op.table, physical, shard, local: local_id, global }));
             }
-            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call => {
+            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll => {
                 return fail(&mut tx, rid, format!("{:?} not supported in atomic batch", op.op))
             }
         }
@@ -1173,7 +1245,7 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
 /// Responds one row: the `Return` value (`{"result": v}`, or a `Json` object
 /// flattened) plus `_applied` (per-write `{table, id}` in buffer order).
 fn execute_procedure(
-    server: &BlitzServer,
+    server: &std::sync::Arc<BlitzServer>,
     authed: &Option<blitz_auth::Identity>,
     req: Request,
 ) -> Response {
@@ -4107,6 +4179,151 @@ mod tests {
         assert_eq!(resp["ok"], false);
         assert!(resp["error"].as_str().unwrap_or("").contains("insufficient balance"),
             "got {:?}", resp);
+    }
+
+    /// Minimal echo guest for job tests (copies input to OUTPUT_BASE).
+    fn echo_wasm() -> Vec<u8> {
+        wat::parse_str(r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "run") (param $in i32) (param $len i32) (result i64)
+    (local $i i32)
+    (block $done
+      (loop $cp
+        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+        (i32.store8
+          (i32.add (i32.const 32768) (local.get $i))
+          (i32.load8_u (i32.add (local.get $in) (local.get $i))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $cp)))
+    (i64.or
+      (i64.shl (i64.const 32768) (i64.const 32))
+      (i64.extend_i32_u (local.get $len)))))"#).unwrap()
+    }
+
+    /// Fuel-burner guest (never returns on its own).
+    fn loop_wasm() -> Vec<u8> {
+        wat::parse_str(r#"
+(module
+  (memory (export "memory") 1)
+  (func (export "run") (param i32 i32) (result i64)
+    (loop $l (br 0))
+    (i64.const 0)))"#).unwrap()
+    }
+
+    async fn poll_job(client: &mut Client, id: u64, job_id: &str) -> std::collections::HashMap<String, Value> {
+        // Background execution is fast (µs-ms); poll briefly, fail loudly.
+        for _ in 0..200 {
+            let r = client
+                .roundtrip(&Request {
+                    id,
+                    op: Op::JobPoll,
+                    table: "jobs".into(),
+                    row_id: None,
+                    values: Some(values(&[("_job", Value::String(job_id.into()))])),
+                })
+                .await
+                .unwrap();
+            assert!(r.ok, "poll failed: {:?}", r.error);
+            let status = r.rows[0].values.get("status").cloned();
+            if status != Some(Value::String("pending".into()))
+                && status != Some(Value::String("running".into()))
+            {
+                return r.rows[0].values.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("job {} never settled", job_id);
+    }
+
+    #[tokio::test]
+    async fn test_job_submit_echo_poll() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let r = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::JobSubmit,
+                table: "jobs".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("wasm", Value::Bytes(echo_wasm())),
+                    ("input", Value::String("hello-jobs".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "submit failed: {:?}", r.error);
+        let job_id = match r.rows[0].values.get("job_id") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("missing job_id: {:?}", other),
+        };
+        let out = poll_job(&mut client, 2, &job_id).await;
+        assert_eq!(out.get("status"), Some(&Value::String("completed".into())), "got {:?}", out);
+        assert_eq!(out.get("result"), Some(&Value::String("hello-jobs".into())));
+    }
+
+    #[tokio::test]
+    async fn test_job_fuel_kill_and_unknown() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let r = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::JobSubmit,
+                table: "jobs".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("wasm", Value::Bytes(loop_wasm())),
+                    ("input", Value::String("".into())),
+                    ("_retries", Value::Int64(0)),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "submit failed: {:?}", r.error);
+        let job_id = match r.rows[0].values.get("job_id") {
+            Some(Value::String(s)) => s.clone(),
+            other => panic!("missing job_id: {:?}", other),
+        };
+        let out = poll_job(&mut client, 2, &job_id).await;
+        assert_eq!(out.get("status"), Some(&Value::String("failed".into())), "got {:?}", out);
+        assert!(matches!(out.get("error"), Some(Value::String(e)) if e.contains("fuel")),
+            "got {:?}", out);
+        // Unknown job id errors honestly.
+        let r = client
+            .roundtrip(&Request {
+                id: 3,
+                op: Op::JobPoll,
+                table: "jobs".into(),
+                row_id: None,
+                values: Some(values(&[("_job", Value::String("nope".into()))])),
+            })
+            .await
+            .unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("job not found"), "got {:?}", r);
+        // Job ops inside atomic batches abort (background work can't roll back).
+        let b = roundtrip_atomic(&mut client, 50, vec![Request {
+            id: 51,
+            op: Op::JobSubmit,
+            table: "jobs".into(),
+            row_id: None,
+            values: Some(values(&[
+                ("wasm", Value::Bytes(echo_wasm())),
+                ("input", Value::String("x".into())),
+            ])),
+        }])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|x| !x.ok), "nested job must abort: {:?}", b.results);
     }
 
     #[tokio::test]

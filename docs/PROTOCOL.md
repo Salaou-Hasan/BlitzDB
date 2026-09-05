@@ -108,6 +108,23 @@ The server runs the registered procedure's steps in one OCC transaction
   over-TCP deploy/versioning is future work. Strict `Int64`/`UInt64` columns
   (no coercion): pass IDs in the column's own type.
 
+## Background WASM jobs (`Op::JobSubmit` tag 10, `Op::JobPoll` tag 11)
+
+Submit a module once, poll for completion — guests never run inline:
+
+- `JobSubmit`: `values {wasm: Bytes, input: String, _type?: String,
+  _retries?: Int 0..5}` → one row `{job_id, status: "pending"}`.
+  Modules capped at 1MiB; fuel/memory default to the server's
+  `WasmExecutor` budget (runaways die, retried per job policy).
+- `JobPoll`: `values {_job: String}` → `{job_id, status, result?,
+  error?}` with `status` in pending/running/completed/failed/cancelled.
+  Unknown ids err; retention bounded (oldest terminal evicted past 4096,
+  submit rejects when only live jobs remain).
+- Auth: `Custom("job.submit")` / `Custom("job.poll")` (table slot ignored,
+  convention `"jobs"`). Rejected inside atomic batches (background work
+  can't roll back). HTTP bridge: `job_submit` / `job_poll` op names,
+  module bytes via `{"$bytes": "<base64>"}`.
+
 ## Auth sessions + row ownership
 
 - Sessions: `register_session(token, identity, ttl_secs)` mints short-lived

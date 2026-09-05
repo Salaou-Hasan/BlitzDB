@@ -282,7 +282,25 @@ pub struct BlitzServer {
     /// Pure-compute functions callable from procedure steps (builtins
     /// registered at startup; embedders can add more).
     functions: RwLock<blitz_runtime::FunctionRegistry>,
+    /// Submitted WASM jobs by id string. Bounded (oldest terminal evicted
+    /// past the cap; submit rejects when only live jobs remain).
+    wasm_jobs: RwLock<HashMap<String, StoredWasmJob>>,
+    /// Shared Wasmtime engine, built once on first submit (slow ~ms).
+    wasm_engine: std::sync::OnceLock<Result<blitz_jobs::WasmExecutor, String>>,
 }
+
+/// One background WASM job: the record polled over TCP plus its inputs.
+#[derive(Clone)]
+pub struct StoredWasmJob {
+    pub job: blitz_jobs::Job,
+    pub wasm: Vec<u8>,
+    pub input: String,
+}
+
+/// Max retained jobs (terminal-first eviction past this).
+pub const MAX_WASM_JOBS: usize = 4096;
+/// Max submitted module bytes (group framing already caps frames at 1MiB).
+pub const MAX_WASM_BYTES: usize = 1_048_576;
 
 impl BlitzServer {
     pub fn new() -> Self {
@@ -325,6 +343,8 @@ impl BlitzServer {
             fanout_dropped: std::sync::atomic::AtomicU64::new(0),
             procedures: RwLock::new(HashMap::new()),
             functions: RwLock::new(functions),
+            wasm_jobs: RwLock::new(HashMap::new()),
+            wasm_engine: std::sync::OnceLock::new(),
         }
     }
 
@@ -456,6 +476,89 @@ impl BlitzServer {
     ) -> Result<Value, String> {
         let g = self.functions.read().map_err(|e| format!("function registry locked: {}", e))?;
         g.execute(name, args).map_err(|e| e.to_string())
+    }
+
+    // -- Background WASM jobs (submit/poll over TCP) -------------------
+
+    /// Shared executor, built once (slow) on first submit.
+    pub fn wasm_executor(&self) -> Result<blitz_jobs::WasmExecutor, String> {
+        self.wasm_engine
+            .get_or_init(|| {
+                blitz_jobs::WasmExecutor::new().map_err(|e| format!("wasm engine: {}", e))
+            })
+            .clone()
+    }
+
+    /// Store a job as Pending and hand back its id. The caller (which holds
+    /// `Arc<Self>`) spawns `run_wasm_job` on the blocking pool. Bounded:
+    /// evicts the oldest terminal job past the cap; rejects when only live
+    /// jobs remain (honest backpressure, retryable).
+    pub fn store_wasm_job(&self, mut job: blitz_jobs::Job, wasm: Vec<u8>, input: String) -> Result<String, String> {
+        if wasm.len() > MAX_WASM_BYTES {
+            return Err(format!("wasm too large (max {} bytes)", MAX_WASM_BYTES));
+        }
+        let id = job.id.to_string();
+        let mut jobs = self.wasm_jobs.write().map_err(|e| format!("job store locked: {}", e))?;
+        if jobs.len() >= MAX_WASM_JOBS {
+            // Oldest terminal first.
+            let mut terminal: Vec<(chrono::DateTime<chrono::Utc>, String)> = jobs
+                .iter()
+                .filter(|(_, s)| matches!(s.job.status, blitz_jobs::JobStatus::Completed | blitz_jobs::JobStatus::Failed | blitz_jobs::JobStatus::Cancelled))
+                .filter_map(|(k, s)| s.job.completed_at.map(|t| (t, k.clone())))
+                .collect();
+            terminal.sort();
+            if let Some((_, oldest)) = terminal.into_iter().next() {
+                jobs.remove(&oldest);
+            } else {
+                return Err("job queue full (all live; poll and retry)".to_string());
+            }
+        }
+        job.payload.insert("input_len".into(), input.len().to_string());
+        jobs.insert(id.clone(), StoredWasmJob { job, wasm, input });
+        Ok(id)
+    }
+
+    /// Execute a stored job to terminal state (blocking-pool body): loads,
+    /// marks running, runs with retries, stores back. Returns the final job.
+    pub fn run_wasm_job(&self, id: &str) -> Option<blitz_jobs::Job> {
+        let (mut job, wasm, input) = {
+            let mut jobs = self.wasm_jobs.write().ok()?;
+            let stored = jobs.get_mut(id)?;
+            stored.job.mark_running();
+            (stored.job.clone(), stored.wasm.clone(), stored.input.clone())
+        };
+        let executor = match self.wasm_executor() {
+            Ok(ex) => ex,
+            Err(e) => {
+                job.mark_failed(format!("engine: {}", e));
+                if let Ok(mut jobs) = self.wasm_jobs.write() {
+                    if let Some(s) = jobs.get_mut(id) {
+                        s.job = job.clone();
+                    }
+                }
+                return Some(job);
+            }
+        };
+        // Guest failures retry per the job model (transient-friendly);
+        // deterministic traps burn retries fast (documented).
+        loop {
+            match blitz_jobs::run_job(&executor, &mut job, &wasm, &input) {
+                Ok(()) => break,
+                Err(_) if job.can_retry() => continue,
+                Err(_) => break,
+            }
+        }
+        if let Ok(mut jobs) = self.wasm_jobs.write() {
+            if let Some(s) = jobs.get_mut(id) {
+                s.job = job.clone();
+            }
+        }
+        Some(job)
+    }
+
+    /// Fetch a job record for polling (clone under one read lock).
+    pub fn get_wasm_job(&self, id: &str) -> Option<blitz_jobs::Job> {
+        self.wasm_jobs.read().ok()?.get(id).map(|s| s.job.clone())
     }
 
     pub fn event_emitter(&self) -> &EventEmitter {
@@ -789,6 +892,8 @@ impl BlitzServer {
             Op::Get | Op::Scan | Op::Find | Op::Subscribe | Op::Search => Permission::Read,
             Op::Delete => Permission::Delete,
             Op::Call => Permission::Custom("call".to_string()),
+            Op::JobSubmit => Permission::Custom("job.submit".to_string()),
+            Op::JobPoll => Permission::Custom("job.poll".to_string()),
             Op::Ping => return Ok(()),
         };
         let id = ident.as_ref().ok_or("unauthorized: authentication required")?;

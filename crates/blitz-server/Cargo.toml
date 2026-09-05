@@ -17,6 +17,7 @@ blitz-storage = { path = "../blitz-storage" }
 blitz-wal = { path = "../blitz-wal" }
 blitz-snapshot = { path = "../blitz-snapshot" }
 blitz-runtime = { path = "../blitz-runtime" }
+blitz-jobs = { path = "../blitz-jobs" }
 blitz-auth = { path = "../blitz-auth" }
 blitz-policy = { path = "../blitz-policy" }
 blitz-events = { path = "../blitz-events" }
@@ -40,3 +41,4 @@ rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.12"
+wat = "=1.251.0"

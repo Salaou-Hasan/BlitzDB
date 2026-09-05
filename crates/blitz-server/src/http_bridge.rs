@@ -52,6 +52,8 @@ pub fn request_from_json(v: &serde_json::Value) -> Result<Request, String> {
         "find" => Op::Find,
         "search" => Op::Search,
         "call" => Op::Call,
+        "job_submit" => Op::JobSubmit,
+        "job_poll" => Op::JobPoll,
         _ => return Err(format!("unknown op: {}", opname)),
     };
     let id = obj
@@ -308,7 +310,7 @@ fn auth_status(err: &str) -> Option<u16> {
 }
 
 /// Handle one `POST /v1/op` body. Returns (status, json body).
-pub fn handle_op(server: &BlitzServer, ident: &Option<blitz_auth::Identity>, body: &[u8]) -> (u16, String) {
+pub fn handle_op(server: &std::sync::Arc<BlitzServer>, ident: &Option<blitz_auth::Identity>, body: &[u8]) -> (u16, String) {
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"ok": false, "error": format!("malformed JSON: {}", e)}).to_string()),
@@ -338,7 +340,7 @@ pub fn handle_op(server: &BlitzServer, ident: &Option<blitz_auth::Identity>, bod
 /// Handle one `POST /v1/batch` body: `{"ops":[...],"atomic":bool}`.
 /// Non-atomic batches return per-op results (partial failure normal);
 /// atomic frames are all-or-nothing via the same OCC path as TCP.
-pub fn handle_batch(server: &BlitzServer, ident: &Option<blitz_auth::Identity>, body: &[u8]) -> (u16, String) {
+pub fn handle_batch(server: &std::sync::Arc<BlitzServer>, ident: &Option<blitz_auth::Identity>, body: &[u8]) -> (u16, String) {
     let parsed: serde_json::Value = match serde_json::from_slice(body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"ok": false, "error": format!("malformed JSON: {}", e)}).to_string()),

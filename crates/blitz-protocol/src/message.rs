@@ -35,6 +35,13 @@ pub enum Op {
     /// `values` are the call arguments. Runs all steps in one OCC
     /// transaction (all-or-nothing); responds one row with the result.
     Call,
+    /// Submit a WASM job for background execution: `values {wasm: Bytes,
+    /// input: String}`. Returns immediately (`{job_id, status}`); poll with
+    /// `JobPoll`. Never inline — guests run on the blocking pool.
+    JobSubmit,
+    /// Poll a submitted job: `values {_job: String id}` → `{job_id,
+    /// status, result?, error?}`. Missing jobs err (bounded retention).
+    JobPoll,
 }
 
 impl Op {
@@ -50,6 +57,8 @@ impl Op {
             Op::Find => 7,
             Op::Search => 8,
             Op::Call => 9,
+            Op::JobSubmit => 10,
+            Op::JobPoll => 11,
         }
     }
 
@@ -65,6 +74,8 @@ impl Op {
             7 => Some(Op::Find),
             8 => Some(Op::Search),
             9 => Some(Op::Call),
+            10 => Some(Op::JobSubmit),
+            11 => Some(Op::JobPoll),
             _ => None,
         }
     }
@@ -169,11 +180,13 @@ mod tests {
             (Op::Find, 7),
             (Op::Search, 8),
             (Op::Call, 9),
+            (Op::JobSubmit, 10),
+            (Op::JobPoll, 11),
         ] {
             assert_eq!(op.tag(), tag);
             assert_eq!(Op::from_tag(tag), Some(op));
         }
-        assert_eq!(Op::from_tag(10), None);
+        assert_eq!(Op::from_tag(12), None);
         assert_eq!(Op::from_tag(255), None);
     }
 
