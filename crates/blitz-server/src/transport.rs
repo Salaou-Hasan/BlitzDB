@@ -266,7 +266,7 @@ fn enforce_owner(
     server.authorize_row(authed, op, base, values.get(&col))
 }
 
-fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Request) -> Response {
+pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Request) -> Response {
     let id = req.id;
     // Row-owner tables reject collection reads fail-closed (no silent
     // row-dropping: pagination/counts would lie). Point reads stay available.
@@ -632,7 +632,7 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
 ///   every op, commits an empty tx, and returns the original IDs.
 /// - `skip_validation` is NOT honored here (tx apply always validates):
 ///   atomic batches trade ~µs/op for the guarantee. Measured, not hidden.
-fn execute_atomic(
+pub(crate) fn execute_atomic(
     server: &BlitzServer,
     authed: &mut Option<blitz_auth::Identity>,
     batch: BatchRequest,
@@ -1758,41 +1758,99 @@ pub async fn serve_http_ops(server: Arc<BlitzServer>, listener: TcpListener) -> 
         let server = Arc::clone(&server);
         tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            let mut buf = [0u8; 4096];
-            // Single-read request parse (paths are tiny; larger → 414).
-            let n = match socket.read(&mut buf).await {
-                Ok(n) => n,
-                Err(_) => return,
+            // Headers first (cap 16KiB), then exactly Content-Length body
+            // bytes (cap: max_message_size, else 413). One request per
+            // connection (HTTP/1.0 close) — this is an ops bridge, not a
+            // general server.
+            let mut head = Vec::with_capacity(1024);
+            let mut byte = [0u8; 1];
+            let header_end = loop {
+                match socket.read(&mut byte).await {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        head.push(byte[0]);
+                        if head.len() > 16384 {
+                            let _ = socket.write_all(b"HTTP/1.0 413 Too Large\r\nconnection: close\r\n\r\n").await;
+                            return;
+                        }
+                        if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
+                            break head.len();
+                        }
+                    }
+                    Err(_) => return,
+                }
             };
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let path = req
-                .lines()
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .unwrap_or("/");
-            let (code, ctype, body) = match path {
-                "/metrics" => (200, "text/plain; version=0.0.4", server.metrics_text()),
-                "/readyz" => {
+            let req_text = String::from_utf8_lossy(&head[..header_end]);
+            let mut lines = req_text.lines();
+            let request_line = lines.next().unwrap_or("/");
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("");
+            let path = parts.next().unwrap_or("/");
+            let mut content_length: usize = 0;
+            let mut bearer: Option<String> = None;
+            for line in lines {
+                let line = line.trim_end_matches('\r');
+                if let Some(v) = line.strip_prefix("content-length:").or_else(|| line.strip_prefix("Content-Length:")) {
+                    content_length = v.trim().parse().unwrap_or(0);
+                } else if let Some(v) = line.strip_prefix("authorization:").or_else(|| line.strip_prefix("Authorization:")) {
+                    let v = v.trim();
+                    if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
+                        bearer = Some(tok.trim().to_string());
+                    }
+                }
+            }
+            let max_body = server.config().max_message_size.max(1024);
+            if content_length > max_body {
+                let _ = socket.write_all(b"HTTP/1.0 413 Too Large\r\nconnection: close\r\n\r\n").await;
+                return;
+            }
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 {
+                if let Err(_) = tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body).await {
+                    return;
+                }
+            }
+            // Stateless identity per request (no connection stickiness).
+            let authed = bearer.as_deref().and_then(|t| server.resolve_token(t));
+            let (code, ctype, resp_body): (u16, &str, String) = match (method, path) {
+                ("GET", "/metrics") => (200, "text/plain; version=0.0.4", server.metrics_text()),
+                ("GET", "/readyz") => {
                     if server.uptime_secs().is_some() {
                         (200, "text/plain", "ok\n".to_string())
                     } else {
                         (503, "text/plain", "starting\n".to_string())
                     }
                 }
+                ("POST", "/v1/op") => {
+                    let (c, b) = crate::http_bridge::handle_op(&server, &authed, &body);
+                    (c, "application/json", b)
+                }
+                ("POST", "/v1/batch") => {
+                    let (c, b) = crate::http_bridge::handle_batch(&server, &authed, &body);
+                    (c, "application/json", b)
+                }
+                _ if method != "GET" && (path == "/v1/op" || path == "/v1/batch") => {
+                    (405, "text/plain", "method not allowed (use POST)\n".to_string())
+                }
                 _ => (404, "text/plain", "not found\n".to_string()),
             };
             let reason = match code {
                 200 => "OK",
+                400 => "Bad Request",
+                401 => "Unauthorized",
+                403 => "Forbidden",
                 404 => "Not Found",
+                405 => "Method Not Allowed",
+                413 => "Too Large",
                 503 => "Service Unavailable",
                 _ => "OK",
             };
             let head = format!(
                 "HTTP/1.0 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                code, reason, ctype, body.len()
+                code, reason, ctype, resp_body.len()
             );
             let _ = socket.write_all(head.as_bytes()).await;
-            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.write_all(resp_body.as_bytes()).await;
         });
     }
 }
@@ -3249,8 +3307,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_push_stream_delivers_writer_insert() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    async fn test_push_stream_delivers_writer_insert() {        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let server = Arc::new(BlitzServer::new());
         server.start().await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3646,6 +3703,190 @@ mod tests {
         s.read_to_end(&mut out).await.unwrap();
         let txt = String::from_utf8_lossy(&out);
         assert!(txt.contains("blitz_requests_total"), "metrics: {}", &txt[..txt.len().min(200)]);
+    }
+
+    /// Raw HTTP helper: POST JSON, returns (status, parsed body).
+    async fn post_json(
+        addr: std::net::SocketAddr,
+        path: &str,
+        body: serde_json::Value,
+        token: Option<&str>,
+    ) -> (u16, serde_json::Value) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let body_str = body.to_string();
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let mut req = format!(
+            "POST {} HTTP/1.0\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
+            path,
+            body_str.len()
+        );
+        if let Some(t) = token {
+            req.push_str(&format!("authorization: Bearer {}\r\n", t));
+        }
+        req.push_str("\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        s.write_all(body_str.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        s.read_to_end(&mut out).await.unwrap();
+        let txt = String::from_utf8_lossy(&out);
+        let status: u16 = txt
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        let body_start = txt.find("\r\n\r\n").map(|i| i + 4).unwrap_or(txt.len());
+        let parsed = serde_json::from_str(&txt[body_start..]).unwrap_or(serde_json::Value::Null);
+        (status, parsed)
+    }
+
+    async fn http_server() -> (Arc<BlitzServer>, std::net::SocketAddr) {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(super::serve_http_ops(Arc::clone(&server), listener));
+        (server, addr)
+    }
+
+    #[tokio::test]
+    async fn test_http_op_crud_roundtrip() {
+        use serde_json::json;
+        let (_server, addr) = http_server().await;
+        // Insert via JSON envelope.
+        let (code, resp) = post_json(addr, "/v1/op", json!({
+            "id": 1, "op": "insert", "table": "users",
+            "values": {"id": 501, "name": "Curl", "email": "curl@x.com"}
+        }), None).await;
+        assert_eq!(code, 200, "got {:?}", resp);
+        assert_eq!(resp["ok"], true, "got {:?}", resp);
+        let gid = resp["rows"][0]["id"].as_u64().expect("row id");
+        // Get back.
+        let (code, resp) = post_json(addr, "/v1/op", json!({
+            "id": 2, "op": "get", "table": "users", "row_id": gid
+        }), None).await;
+        assert_eq!((code, resp["ok"].clone()), (200, json!(true)));
+        assert_eq!(resp["rows"][0]["values"]["name"], json!("Curl"));
+        // Update + delete.
+        let (_, resp) = post_json(addr, "/v1/op", json!({
+            "id": 3, "op": "update", "table": "users", "row_id": gid,
+            "values": {"name": "Curl2"}
+        }), None).await;
+        assert_eq!(resp["ok"], true, "got {:?}", resp);
+        let (_, resp) = post_json(addr, "/v1/op", json!({
+            "id": 4, "op": "delete", "table": "users", "row_id": gid
+        }), None).await;
+        assert_eq!(resp["ok"], true, "got {:?}", resp);
+        // Get-miss stays in-band (200 + ok:false), like TCP err payloads.
+        let (code, resp) = post_json(addr, "/v1/op", json!({
+            "id": 5, "op": "get", "table": "users", "row_id": gid
+        }), None).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["ok"], false);
+    }
+
+    #[tokio::test]
+    async fn test_http_batch_and_atomic() {
+        use serde_json::json;
+        let (server, addr) = http_server().await;
+        // Seed a taken email.
+        let (_, seed) = post_json(addr, "/v1/op", json!({
+            "id": 1, "op": "insert", "table": "users",
+            "values": {"id": 601, "name": "Seed", "email": "taken@x.com"}
+        }), None).await;
+        assert_eq!(seed["ok"], true);
+        let mk = |id: u64, email: &str| json!({
+            "id": id, "op": "insert", "table": "users",
+            "values": {"id": id, "name": "N", "email": email}
+        });
+        // Plain batch: partial failure normal.
+        let (_, resp) = post_json(addr, "/v1/batch", json!({
+            "id": 50, "ops": [mk(51, "taken@x.com"), mk(52, "fresh@x.com")]
+        }), None).await;
+        assert_eq!(resp["results"][0]["ok"], false, "got {:?}", resp);
+        assert_eq!(resp["results"][1]["ok"], true, "got {:?}", resp);
+        // Atomic batch: all-or-nothing.
+        let (_, resp) = post_json(addr, "/v1/batch", json!({
+            "id": 60, "atomic": true, "ops": [mk(61, "fresh2@x.com"), mk(62, "taken@x.com")]
+        }), None).await;
+        assert!(resp["results"].as_array().unwrap().iter().all(|r| r["ok"] == false),
+            "got {:?}", resp);
+        assert_eq!(server.engine().count("users").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_http_auth_and_envelope_errors() {
+        use serde_json::json;
+        // Secured server: owned docs + bearer tokens (reuse the TCP helper).
+        let server = owned_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(super::serve_http_ops(Arc::clone(&server), listener));
+        // No token → 401.
+        let (code, resp) = post_json(addr, "/v1/op", json!({
+            "id": 1, "op": "insert", "table": "docs",
+            "values": {"id": 1, "owner": "alice", "body": "a"}
+        }), None).await;
+        assert_eq!(code, 401, "got {:?}", resp);
+        // Alice's own insert → 200.
+        let (code, resp) = post_json(addr, "/v1/op", json!({
+            "id": 2, "op": "insert", "table": "docs",
+            "values": {"id": 1, "owner": "alice", "body": "a"}
+        }), Some("tok-alice")).await;
+        assert_eq!((code, resp["ok"].clone()), (200, json!(true)), "got {:?}", resp);
+        let gid = resp["rows"][0]["id"].as_u64().unwrap();
+        // Bob reads alice's doc → hidden as not-found, in-band 200.
+        let (code, resp) = post_json(addr, "/v1/op", json!({
+            "id": 3, "op": "get", "table": "docs", "row_id": gid
+        }), Some("tok-bob")).await;
+        assert_eq!(code, 200);
+        assert_eq!(resp["ok"], false);
+        // Bob writes alice's doc → 403.
+        let (code, resp) = post_json(addr, "/v1/op", json!({
+            "id": 4, "op": "update", "table": "docs", "row_id": gid,
+            "values": {"body": "hijack"}
+        }), Some("tok-bob")).await;
+        assert_eq!(code, 403, "got {:?}", resp);
+        // Malformed envelope → 400. Unknown op → 400.
+        let (code, _) = post_json(addr, "/v1/op", json!({"id": 5, "table": "docs"}), Some("tok-alice")).await;
+        assert_eq!(code, 400);
+        let (code, _) = post_json(addr, "/v1/op", json!({"id": 6, "op": "frobnicate"}), Some("tok-alice")).await;
+        assert_eq!(code, 400);
+    }
+
+    #[tokio::test]
+    async fn test_http_call_and_values() {
+        use serde_json::json;
+        let (server, addr) = http_server().await;
+        server.register_procedure(checkout_procedure());
+        server
+            .engine()
+            .create_table(accounts_schema())
+            .unwrap();
+        server.engine().create_table(orders_schema()).unwrap();
+        // Seed via HTTP too (proves JSON ints hit Int64 columns).
+        let (_, seed) = post_json(addr, "/v1/op", json!({
+            "id": 1, "op": "insert", "table": "accounts",
+            "values": {"id": 1, "balance": 100, "status": "active"}
+        }), None).await;
+        assert_eq!(seed["ok"], true, "got {:?}", seed);
+        let acct = seed["rows"][0]["id"].as_u64().unwrap();
+        // Checkout through the bridge: balance gate + two writes + _applied.
+        let (_, resp) = post_json(addr, "/v1/op", json!({
+            "id": 2, "op": "call", "table": "fn:checkout",
+            "values": {"account_id": acct, "price": 40}
+        }), None).await;
+        assert_eq!(resp["ok"], true, "got {:?}", resp);
+        assert_eq!(resp["rows"][0]["values"]["_applied"].as_array().unwrap().len(), 2);
+        // Insufficient balance aborts verbatim.
+        let (_, resp) = post_json(addr, "/v1/op", json!({
+            "id": 3, "op": "call", "table": "fn:checkout",
+            "values": {"account_id": acct, "price": 99999}
+        }), None).await;
+        assert_eq!(resp["ok"], false);
+        assert!(resp["error"].as_str().unwrap_or("").contains("insufficient balance"),
+            "got {:?}", resp);
     }
 
     #[tokio::test]

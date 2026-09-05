@@ -123,6 +123,28 @@ The server runs the registered procedure's steps in one OCC transaction
   row-owner tables fail closed — use point reads. (Query-time filtering is
   future work; v1 refuses to silently drop rows.)
 
+## HTTP bridge (`serve_http_ops`)
+
+JSON over HTTP/1.0 for mobile/curl/webhooks; the binary protocol stays the
+hot path. One request per connection (close-delimited).
+
+- `POST /v1/op` — single op envelope `{op, table?, row_id?, values?}` →
+  `{ok, rows?, error?}`. Server errors stay in-band (HTTP 200) except
+  envelope auth (`401` unauthenticated, `403` policy/owner denial) and
+  malformed envelopes/unknown ops (`400`).
+- `POST /v1/batch` — `{ops: [...], atomic?: bool, id?}` → per-op results
+  (partial failure normal) or all-or-nothing when `atomic: true` (same OCC
+  path as TCP kind `0x03`).
+- Auth: `Authorization: Bearer <token>` per request (stateless; `_auth`
+  values inside batch ops also honored). `call` uses `table: "fn:<name>"`.
+- JSON values: safe-integer numbers → Int64, other numbers → Float64
+  (server is type-strict: `{"$i32"}`,`{"$u32"}`,`{"$i64"}`,`{"$u64"}`,
+  `{"$f32"}` for exact widths); UUID-shaped strings → Uuid;
+  `{"$decimal"}`, `{"$date":"YYYY-MM-DD"}`, `{"$uuid"}`,
+  `{"$bytes":"<base64>"}`, `{"$ts":<micros>}` supported. Outbound big u64
+  (incl. sharded RowIds) come back as strings when f64-unsafe; bytes as
+  `{"$bytes":...}`; dates/decimals/uuids tagged as inbound.
+
 ## Errors (typed strings for SDK mapping)
 
 - `unauthorized: authentication required` → handshake first, then retry.

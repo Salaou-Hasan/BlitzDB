@@ -1,5 +1,6 @@
 pub mod bench_common;
 pub mod durability;
+pub mod http_bridge;
 pub mod server;
 pub mod social;
 pub mod transport;
