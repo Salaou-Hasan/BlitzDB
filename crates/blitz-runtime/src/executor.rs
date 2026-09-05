@@ -96,6 +96,23 @@ impl RuntimeExecutor {
                 }
                 Ok(last_value)
             }
+            // DB steps need a transaction backend: the pure-compute executor
+            // rejects them loudly instead of faking execution. Use the
+            // transactional runner (`runner::run_procedure`) on the server.
+            ProcedureStep::Read { table, .. } => Err(crate::RuntimeError::ExecutionError(
+                format!("Read({}) needs a transaction: use the server Call path", table),
+            )),
+            ProcedureStep::Insert { table, .. } => Err(crate::RuntimeError::ExecutionError(
+                format!("Insert({}) needs a transaction: use the server Call path", table),
+            )),
+            ProcedureStep::Update { table, .. } => Err(crate::RuntimeError::ExecutionError(
+                format!("Update({}) needs a transaction: use the server Call path", table),
+            )),
+            ProcedureStep::Delete { table, .. } => Err(crate::RuntimeError::ExecutionError(
+                format!("Delete({}) needs a transaction: use the server Call path", table),
+            )),
+            ProcedureStep::Return { value } => Ok(self.resolve_value(value)),
+            ProcedureStep::Fail { message } => Err(crate::RuntimeError::Abort(message.clone())),
         }
     }
 
@@ -115,8 +132,26 @@ impl RuntimeExecutor {
     fn evaluate_condition(&self, condition: &Condition) -> RuntimeResult<bool> {
         match condition {
             Condition::Equals(var_name, expected) => {
+                let exp = self.resolve_value(expected);
                 let actual = self.variables.get(var_name);
-                Ok(actual.map_or(false, |v| v == expected))
+                Ok(actual.map_or(false, |v| v == &exp))
+            }
+            Condition::NotEquals(var_name, expected) => {
+                let exp = self.resolve_value(expected);
+                let actual = self.variables.get(var_name);
+                Ok(actual.map_or(false, |v| v != &exp))
+            }
+            Condition::GreaterOrEqual(var_name, expected) => {
+                let exp = self.resolve_value(expected);
+                Ok(self.variables.get(var_name).map_or(false, |v| {
+                    v.cmp(&exp) != std::cmp::Ordering::Less
+                }))
+            }
+            Condition::LessThan(var_name, expected) => {
+                let exp = self.resolve_value(expected);
+                Ok(self.variables.get(var_name).map_or(false, |v| {
+                    v.cmp(&exp) == std::cmp::Ordering::Less
+                }))
             }
             Condition::IsNotNull(var_name) => {
                 Ok(self.variables.get(var_name).map_or(false, |v| !v.is_null()))

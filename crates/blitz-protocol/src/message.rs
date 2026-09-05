@@ -30,6 +30,11 @@ pub enum Op {
     /// `values {_q: String, _limit: Int}`. Single-node inverted index
     /// (8 terms/post, 128/posting cap). Multi-term ANDs first two terms.
     Search,
+    /// Execute a registered server-side procedure transactionally:
+    /// `table` carries the resource `fn:<name>` (policy namespace),
+    /// `values` are the call arguments. Runs all steps in one OCC
+    /// transaction (all-or-nothing); responds one row with the result.
+    Call,
 }
 
 impl Op {
@@ -44,6 +49,7 @@ impl Op {
             Op::Subscribe => 6,
             Op::Find => 7,
             Op::Search => 8,
+            Op::Call => 9,
         }
     }
 
@@ -58,6 +64,7 @@ impl Op {
             6 => Some(Op::Subscribe),
             7 => Some(Op::Find),
             8 => Some(Op::Search),
+            9 => Some(Op::Call),
             _ => None,
         }
     }
@@ -161,11 +168,12 @@ mod tests {
             (Op::Subscribe, 6),
             (Op::Find, 7),
             (Op::Search, 8),
+            (Op::Call, 9),
         ] {
             assert_eq!(op.tag(), tag);
             assert_eq!(Op::from_tag(tag), Some(op));
         }
-        assert_eq!(Op::from_tag(9), None);
+        assert_eq!(Op::from_tag(10), None);
         assert_eq!(Op::from_tag(255), None);
     }
 

@@ -16,11 +16,16 @@ Auth: `_auth` handshake binds identity to the connection (one lookup/conn);
   ▼
 Authorize per op → denied ops become err payloads (never touch engine/WAL)
   ▼
-Dispatch (auto-commit per op; Batch is NOT atomic, partial failure normal):
+Dispatch (auto-commit per op; Batch is NOT atomic, partial failure normal;
+AtomicBatch (0x03) runs one OCC tx, all-or-nothing):
   Insert (validate unless skip + unique-index reserve + id alloc + WAL + change-log + search-index + fanout job)
   Get/Scan zero-copy borrowed encode · Update (move) · Delete
   Find (O(1) unique lookup; non-unique rejected, never scanned)
   Subscribe (bounded long-poll) / Search (bounded postings) / push-stream upgrade
+  AtomicBatch: auth-all → buffer (RYW reads, read-before-write) → single
+  RepeatableRead commit → per-write responses + post-commit WAL/log/derived
+  Call (tag 9): fn-auth + per-step invoker table rights → run procedure steps
+  against tx backend (fuel-capped) → single commit → result row + _applied
   ▼
 Engine: DashMap table map → per-table RwLock → HashMap rows + per-col unique maps
   ▼
@@ -35,9 +40,12 @@ Response encode (presized writer) → write → io/request/slow counters
 ## Consistency contract
 
 - Auto-commit per op. No interactive transactions over TCP (`active_tx = 0`,
-  reported honestly). `tx_manager` exists but owns a separate engine — do not
-  use it on the serving path.
-- Batch = ordered, non-atomic. Retry safety: Gets idempotent; Inserts need
+  reported honestly). `tx_manager` shares the serving engine (same `Arc`):
+  committed tx writes are immediately visible to TCP reads and vice versa.
+  Atomic batches (`0x03`) are the only TCP path through it.
+- Batch = ordered, non-atomic. AtomicBatch = ordered, all-or-nothing
+  (Ping/Get/Insert/Update/Delete; Scan/Find/Subscribe/Search rejected).
+  Retry safety: Gets idempotent; Inserts need
   `_idem` (server dedups 256K bounded, in-memory RPO = group window).
 - Unique/PK enforced O(1) via maintained indexes (insert/check/update/delete/
   replay all maintain; delete frees). Concurrent dup claimants: exactly one wins.

@@ -17,7 +17,7 @@ with op/conn/error/tx-state/queue-state/timestamps.
 |---|---|---|
 | `bench_a_connections` | `... bench_a_connections 100000` | Idle CCU: setup rate, KB/conn, heartbeat p50/p99 |
 | `bench_b_active` | `... bench_b_active 16000 1` | Active ping-pong ceiling (stops at first loss) |
-| `bench_c_app` | `... bench_c_app 50000 20 25 16` | App mix SLOs 10K→50K (`max ops batch shards`); `BLITZ_DATA_DIR`+`BLITZ_DURABILITY` for durable runs |
+| `bench_c_app` | `... bench_c_app 50000 20 25 16` | App mix SLOs 10K→50K (`max ops batch shards`); `BLITZ_DATA_DIR`+`BLITZ_DURABILITY` for durable runs; `BLITZ_ATOMIC=1` for all-or-nothing frames |
 | `bench_c_tiny` | `... bench_c_tiny 10000` | Sequential 1/10/20/100 per-conn + GET-/INSERT-/UPDATE-only isolation |
 | `bench_hotspot` | `... bench_hotspot 10000 50` | 1%-keys/50%-traffic skew (celebrity rule) |
 | `ccu_bench` | `... ccu_bench 20000 16000 1` | Legacy engine/codec/TCP-ramp/pipe/batch survey |
@@ -40,6 +40,11 @@ Durable `every-sec` same load: 50K 1.57M/s p99 28ms PASS (~0.6×);
 `near-sync` 10K 2.66M/s p99 3.2ms PASS. Ping-pong (no batch): 10K/20K PASS,
 30K+ FAIL (Little's law — physics, not a bug). Hotspot 50/50-update
 ping-pong: 10K PASS (p99 ~60–85ms), 50K FAIL (p99 ~400–494ms, syscall-bound).
+
+Atomic batches (`BLITZ_ATOMIC=1`, same 10K app mix): 1.52M/s, p50 3.3ms,
+p99 5.3ms, 0 errors, PASS. Cost of all-or-nothing at 10K: ~0.75× goodput,
++1.4ms p99 vs plain batch (2.03M/s, p99 3.9ms same run) — same latency class,
+0 tx_conflicts (blind inserts + stable-row reads don't contend).
 
 ## Reading results honestly
 

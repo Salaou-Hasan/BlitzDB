@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::error::{TxError, TxResult};
 use crate::transaction::{IsolationLevel, Transaction, WriteOp};
@@ -38,7 +38,9 @@ fn stripe_index(table: &str, id: RowId) -> usize {
 ///   by a newer commit. Blind inserts never conflict, and read-only
 ///   transactions skip validation and take no locks at all.
 pub struct TransactionManager {
-    engine: InMemoryTableEngine,
+    /// Shared with the serving engine (same `Arc` the TCP path reads/writes).
+    /// Committed tx writes are immediately visible to non-transactional ops.
+    engine: Arc<InMemoryTableEngine>,
     next_tx_id: AtomicU64,
     /// Striped commit locks, one per row-key hash bucket.
     commit_stripes: Box<[Mutex<()>]>,
@@ -49,7 +51,7 @@ pub struct TransactionManager {
 }
 
 impl TransactionManager {
-    pub fn new(engine: InMemoryTableEngine) -> Self {
+    pub fn new(engine: Arc<InMemoryTableEngine>) -> Self {
         Self {
             engine,
             next_tx_id: AtomicU64::new(1),
@@ -70,8 +72,13 @@ impl TransactionManager {
         tx
     }
 
-    /// Transactional read: returns the row and records its observed
-    /// version in the transaction's read set for commit-time validation.
+    /// Transactional read with read-your-writes: pending buffered Updates
+    /// merge onto the base row, pending Deletes read as misses. Pending
+    /// Inserts carry pre-commit `RowId(0)` and are unaddressable by id, so
+    /// they are invisible here (documented: insert-then-get-same-row inside
+    /// one transaction is not supported; update-then-get and get-then-update
+    /// are). Returns the row and records its observed version in the
+    /// transaction's read set for commit-time validation.
     ///
     /// The version is read BEFORE the row, so a commit landing in
     /// between can only cause a (safe) spurious conflict, never a
@@ -85,16 +92,42 @@ impl TransactionManager {
         if !tx.is_active() {
             return Err(TxError::Internal("transaction is not active".into()));
         }
-        let version = self
+        // Newest buffered write for this key wins.
+        for op in tx.writes.iter().rev() {
+            match op {
+                WriteOp::Delete { table: t, id: did } if t == table && *did == id => {
+                    let version = self.current_version(table, id)?;
+                    tx.record_read(table, id, version);
+                    return Ok(None);
+                }
+                WriteOp::Update { table: t, id: uid, values } if t == table && *uid == id => {
+                    let version = self.current_version(table, id)?;
+                    let mut base = self.engine.get(table, id)?.ok_or_else(|| {
+                        TxError::CoreError(blitz_core::CoreError::RowNotFound(id.as_u64()))
+                    })?;
+                    for (k, v) in values {
+                        base.values.insert(k.clone(), v.clone());
+                    }
+                    tx.record_read(table, id, version);
+                    return Ok(Some(base));
+                }
+                _ => {}
+            }
+        }
+        let version = self.current_version(table, id)?;
+        let row = self.engine.get(table, id)?;
+        tx.record_read(table, id, version);
+        Ok(row)
+    }
+
+    fn current_version(&self, table: &str, id: RowId) -> TxResult<u64> {
+        Ok(self
             .versions
             .read()
             .map_err(|e| TxError::Internal(format!("failed to acquire version lock: {}", e)))?
             .get(&(table.to_string(), id))
             .copied()
-            .unwrap_or(0);
-        let row = self.engine.get(table, id)?;
-        tx.record_read(table, id, version);
-        Ok(row)
+            .unwrap_or(0))
     }
 
     /// Commit a transaction, applying all buffered writes.
@@ -102,7 +135,17 @@ impl TransactionManager {
     /// Returns [`TxError::Conflict`] when a buffered Update/Delete targets
     /// a row written by a commit newer than this transaction's snapshot.
     /// The transaction is rolled back before the error is returned.
-    pub fn commit(&self, tx: &mut Transaction) -> TxResult<()> {
+    ///
+    /// On success returns one `(table, RowId)` per applied write, in buffer
+    /// order (inserts carry engine-assigned ids) — the atomic-batch path
+    /// maps these back to per-op responses.
+    ///
+    /// Residual edge (documented): a mid-drain apply failure (e.g. racing
+    /// delete slipping past validation on unique-free tables) can leave
+    /// earlier writes applied. OCC validation closes write-write and
+    /// read-write races before apply; the remainder needs row-level apply
+    /// atomicity (future work, not claimed here).
+    pub fn commit(&self, tx: &mut Transaction) -> TxResult<Vec<(String, RowId)>> {
         if !tx.is_active() {
             return Err(TxError::Internal("transaction is not active".into()));
         }
@@ -111,7 +154,7 @@ impl TransactionManager {
         // need no locks at all.
         if !tx.has_writes() {
             tx.commit()?;
-            return Ok(());
+            return Ok(Vec::new());
         }
 
         // Collect the stripes covering this commit's Update/Delete rows,
@@ -230,13 +273,13 @@ impl TransactionManager {
             let mut versions = self.versions.write().map_err(|e| {
                 TxError::Internal(format!("failed to acquire version lock: {}", e))
             })?;
-            for key in touched {
-                versions.insert(key, seq);
+            for key in &touched {
+                versions.insert(key.clone(), seq);
             }
         }
 
         tx.commit()?;
-        Ok(())
+        Ok(touched)
     }
 
     /// Rollback a transaction, discarding all buffered writes.
@@ -248,6 +291,9 @@ impl TransactionManager {
     /// Get a reference to the underlying engine.
     ///
     /// The engine is internally synchronized; no outer lock is needed.
+    /// This is the SAME engine the server serves (shared `Arc`), so
+    /// committed tx writes are immediately visible to TCP reads and vice
+    /// versa (the old split-brain second engine is gone).
     pub fn engine(&self) -> &InMemoryTableEngine {
         &self.engine
     }
@@ -255,7 +301,7 @@ impl TransactionManager {
 
 impl Default for TransactionManager {
     fn default() -> Self {
-        Self::new(InMemoryTableEngine::new())
+        Self::new(Arc::new(InMemoryTableEngine::new()))
     }
 }
 
@@ -274,7 +320,7 @@ mod tests {
             .with_column(ColumnDef::new("id", ColumnType::Int64).primary_key())
             .with_column(ColumnDef::new("name", ColumnType::String));
         engine.create_table(schema).unwrap();
-        TransactionManager::new(engine)
+        TransactionManager::new(Arc::new(engine))
     }
 
     fn setup_counter() -> TransactionManager {
@@ -283,7 +329,7 @@ mod tests {
             .with_column(ColumnDef::new("id", ColumnType::Int64).primary_key())
             .with_column(ColumnDef::new("count", ColumnType::Int64));
         engine.create_table(schema).unwrap();
-        TransactionManager::new(engine)
+        TransactionManager::new(Arc::new(engine))
     }
 
     fn insert_user(tx: &mut Transaction, id: i64, name: &str) {
@@ -315,7 +361,7 @@ mod tests {
             values.insert("count".into(), Value::Int64(n + 1));
             tx.update("counters", id, values).unwrap();
             match manager.commit(&mut tx) {
-                Ok(()) => return conflicts,
+                Ok(_) => return conflicts,
                 Err(TxError::Conflict(_)) => conflicts += 1,
                 Err(e) => panic!("unexpected commit error: {}", e),
             }
@@ -528,6 +574,146 @@ mod tests {
         tx.update("counters", RowId::new(1), values).unwrap();
         let err = manager.commit(&mut tx).unwrap_err();
         assert!(matches!(err, TxError::Conflict(_)));
+    }
+
+    #[test]
+    fn test_commit_returns_per_write_ids() {
+        let manager = setup_counter();
+        let mut tx = manager.begin(IsolationLevel::ReadCommitted);
+
+        let mut row = Row::new(RowId::new(0));
+        row.set("id", Value::Int64(42));
+        row.set("count", Value::Int64(0));
+        tx.insert("counters", row).unwrap();
+        let mut row2 = Row::new(RowId::new(0));
+        row2.set("id", Value::Int64(43));
+        row2.set("count", Value::Int64(1));
+        tx.insert("counters", row2).unwrap();
+
+        let ids = manager.commit(&mut tx).unwrap();
+        assert_eq!(ids.len(), 2, "commit should return one id per applied write");
+        assert_eq!(ids[0].0, "counters");
+        assert_eq!(ids[1].0, "counters");
+        assert_ne!(ids[0].1, ids[1].1, "each insert gets a distinct id");
+
+        // Both rows retrievable by their assigned ids (shared engine: visible).
+        for (_, id) in &ids {
+            let got = manager.engine().get("counters", *id).unwrap();
+            assert!(got.is_some(), "committed row {id} should be visible");
+        }
+    }
+
+    #[test]
+    fn test_read_your_writes_within_transaction() {
+        let manager = setup_manager(); // creates "users" table
+
+        // Commit an insert, learn its assigned id from the commit return.
+        let mut tx1 = manager.begin(IsolationLevel::ReadCommitted);
+        let mut row = Row::new(RowId::new(0));
+        row.set("id", Value::Int64(7));
+        row.set("name", Value::String("Alice".into()));
+        tx1.insert("users", row).unwrap();
+        let ids = manager.commit(&mut tx1).unwrap();
+        assert_eq!(ids.len(), 1);
+        let assigned = ids[0].1;
+
+        // A new transaction reads the committed row (shared engine).
+        let mut tx2 = manager.begin(IsolationLevel::ReadCommitted);
+        let seen = manager
+            .get(&mut tx2, "users", assigned)
+            .unwrap()
+            .expect("committed insert should be visible");
+        assert_eq!(seen.get("name"), Some(&Value::String("Alice".into())));
+        manager.commit(&mut tx2).unwrap();
+
+        // Read-your-writes: update in tx, read back merged view before commit.
+        let mut tx3 = manager.begin(IsolationLevel::ReadCommitted);
+        let mut vals = HashMap::new();
+        vals.insert("name".into(), Value::String("Alicia".into()));
+        tx3.update("users", assigned, vals).unwrap();
+        let merged = manager
+            .get(&mut tx3, "users", assigned)
+            .unwrap()
+            .expect("pending update should be visible as merged view");
+        assert_eq!(merged.get("name"), Some(&Value::String("Alicia".into())));
+        manager.commit(&mut tx3).unwrap();
+        let fin = manager.engine().get("users", assigned).unwrap().unwrap();
+        assert_eq!(fin.get("name"), Some(&Value::String("Alicia".into())));
+    }
+
+#[test]
+    fn test_checkout_style_atomic_flow() {
+        use blitz_types::column::ColumnType;
+        use blitz_types::row::Row;
+        use blitz_types::schema::TableSchema;
+        use blitz_types::value::Value;
+
+        let manager = setup_manager();
+
+        // Create the products and orders tables.
+        let prod_schema = TableSchema::new("products")
+            .with_column(ColumnDef::new("id", ColumnType::Int64).primary_key())
+            .with_column(ColumnDef::new("name", ColumnType::String));
+        manager.engine().create_table(prod_schema).unwrap();
+
+        let ord_schema = TableSchema::new("orders")
+            .with_column(ColumnDef::new("id", ColumnType::Int64).primary_key())
+            .with_column(ColumnDef::new("product_id", ColumnType::Int64))
+            .with_column(ColumnDef::new("qty", ColumnType::Int64));
+        manager.engine().create_table(ord_schema).unwrap();
+
+        // Seed one product row directly in the engine; learn its assigned id.
+        let mut inv_row = Row::new(RowId::new(0));
+        inv_row.set("id", Value::Int64(1));
+        inv_row.set("name", Value::String("widget".into()));
+        let product_id = manager.engine().insert("products", inv_row).unwrap();
+
+        // Simulate checkout: read inventory, decrement it, create the order —
+        // all buffered in one transaction, committed atomically.
+        let mut tx = manager.begin(IsolationLevel::Serializable);
+        let read_back = manager
+            .get(&mut tx, "products", product_id)
+            .unwrap()
+            .expect("seeded product should be readable");
+        assert_eq!(read_back.get("name"), Some(&Value::String("widget".into())));
+
+        let mut vals = HashMap::new();
+        vals.insert("name".into(), Value::String("widget-reserved".into()));
+        tx.update("products", product_id, vals).unwrap();
+
+        let mut order = Row::new(RowId::new(0));
+        order.set("id", Value::Int64(2));
+        order.set("product_id", Value::Int64(1));
+        order.set("qty", Value::Int64(3));
+        tx.insert("orders", order).unwrap();
+
+        // Commit atomically — all-or-nothing. Returns per-write IDs.
+        let committed_ids = manager.commit(&mut tx).unwrap();
+        assert_eq!(committed_ids.len(), 2, "update + order insert commit 2 writes");
+
+        let final_row = manager
+            .engine()
+            .get("products", product_id)
+            .unwrap()
+            .expect("product should still exist");
+        assert_eq!(
+            final_row.get("name"),
+            Some(&Value::String("widget-reserved".into())),
+            "inventory update should be durable after atomic commit"
+        );
+
+        let order_id = committed_ids
+            .iter()
+            .find(|(t, _)| t == "orders")
+            .map(|(_, id)| *id)
+            .expect("order insert id should be reported");
+        let order_row = manager
+            .engine()
+            .get("orders", order_id)
+            .unwrap()
+            .expect("order should exist");
+        assert_eq!(order_row.get("product_id"), Some(&Value::Int64(1)));
+        assert_eq!(order_row.get("qty"), Some(&Value::Int64(3)));
     }
 
     #[test]

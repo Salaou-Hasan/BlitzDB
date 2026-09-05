@@ -41,6 +41,51 @@ frame = one read + one write. Per-op ok/err independent (partial failure
 normal, never atomic). Per-op latency ≈ `batch_time / N` (throughput exact).
 Recommended N = 25.
 
+## Atomic batches (all-or-nothing)
+
+Same `BatchRequest` layout under kind byte `0x03` (`encode_atomic_batch_request`).
+The server runs all ops in one OCC transaction (`RepeatableRead`) and commits
+once: either every result is ok, or every result is err with the abort reason
+and nothing was applied. `BatchResponse` shape is unchanged.
+
+- Allowed ops: `Ping`, `Get`, `Insert`, `Update`, `Delete`.
+- Rejected (whole frame aborts): `Scan`, `Find`, `Subscribe`, `Search` — they
+  read outside tx versioning, so they fail loudly instead of faking atomicity.
+- Reads see a stable snapshot + the batch's own buffered updates/deletes
+  (insert-then-get-same-row is unaddressable: IDs are assigned at commit).
+- Retries use per-op `_idem` (same as single/batch): a retried identical frame
+  replays cached IDs and commits an empty tx.
+- Residuals: concurrent duplicate races on unique-constrained tables can both
+  commit (same as non-atomic today); post-commit WAL failure bumps
+  `wal_dropped` (memory-committed, durable at next snapshot); `skip_validation`
+  is not honored (tx apply always validates).
+
+## Procedures (`Op::Call`, tag 9 — FUNCTIONS)
+
+`table: "fn:<name>"` (policy resource namespace), `values` = call arguments.
+The server runs the registered procedure's steps in one OCC transaction
+(`RepeatableRead`): all-or-nothing, one response row.
+
+- Steps: `Read` (strict — missing row aborts; columns land as `<into>.<col>`
+  plus `<into>.#id`), `Insert`/`Update`/`Delete` (buffered; missing target
+  aborts), `CallFunction` (pure builtins: `now`/`concat`/`upper`/`lower`/
+  `len`/`abs`/`coalesce`), `SetVariable`, `If` (`Equals`/`NotEquals`/
+  `IsNotNull`/`GreaterOrEqual`/`LessThan`/`All`/`Any`), `Return` (ends the
+  call), `Fail` (aborts with message → whole call rolls back).
+- `$var` references resolve against call args + step outputs (same convention
+  as `CallFunction` args). No loops in v1; fuel capped at 10K steps/runaway.
+- Auth is two-level: `Custom("call")` on `fn:<name>` to invoke, plus the
+  caller's table permission re-checked per DB step (invoker rights — a
+  procedure can't exceed what the caller could do op-by-op).
+- Response: one row `{"result": v, "_applied": [{table, id}...]}` (`id: 0`;
+  a `Json`-object return flattens scalar tops). Insert-assigned IDs are
+  reported in `_applied`, not during execution (`into` holds `0` meanwhile:
+  referencing a just-inserted row by id in later steps is unsupported).
+- `Call` inside an atomic batch is rejected (no nested transactions).
+- Registration is in-process at startup in v1 (`register_procedure`);
+  over-TCP deploy/versioning is future work. Strict `Int64`/`UInt64` columns
+  (no coercion): pass IDs in the column's own type.
+
 ## Errors (typed strings for SDK mapping)
 
 - `unauthorized: authentication required` → handshake first, then retry.

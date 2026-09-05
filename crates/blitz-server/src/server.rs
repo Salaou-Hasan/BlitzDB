@@ -131,7 +131,9 @@ pub struct ServerStats {
 /// connection tasks can run concurrently.
 pub struct BlitzServer {
     config: ServerConfig,
-    engine: InMemoryTableEngine,
+    /// Shared with `tx_manager` (same `Arc`): committed tx writes are
+    /// immediately visible to TCP reads and vice versa.
+    engine: std::sync::Arc<InMemoryTableEngine>,
     tx_manager: TransactionManager,
     event_emitter: EventEmitter,
     subscription_manager: RwLock<SubscriptionManager>,
@@ -175,12 +177,21 @@ pub struct BlitzServer {
     fanout_tx: RwLock<Option<FanoutSender>>,
     fanout_done: std::sync::atomic::AtomicU64,
     fanout_dropped: std::sync::atomic::AtomicU64,
+    /// Named server-side procedures (`Op::Call` executes these
+    /// transactionally). Registered in-process at startup/embedding;
+    /// dynamic over-TCP registration is future work (documented).
+    procedures: RwLock<HashMap<String, blitz_runtime::Procedure>>,
+    /// Pure-compute functions callable from procedure steps (builtins
+    /// registered at startup; embedders can add more).
+    functions: RwLock<blitz_runtime::FunctionRegistry>,
 }
 
 impl BlitzServer {
     pub fn new() -> Self {
-        let engine = InMemoryTableEngine::new();
-        let tx_manager = TransactionManager::new(InMemoryTableEngine::new());
+        let engine = std::sync::Arc::new(InMemoryTableEngine::new());
+        let tx_manager = TransactionManager::new(std::sync::Arc::clone(&engine));
+        let mut functions = blitz_runtime::FunctionRegistry::new();
+        blitz_runtime::function::register_builtins(&mut functions);
         Self {
             config: ServerConfig::default(),
             engine,
@@ -213,6 +224,8 @@ impl BlitzServer {
             fanout_tx: RwLock::new(None),
             fanout_done: std::sync::atomic::AtomicU64::new(0),
             fanout_dropped: std::sync::atomic::AtomicU64::new(0),
+            procedures: RwLock::new(HashMap::new()),
+            functions: RwLock::new(functions),
         }
     }
 
@@ -224,15 +237,34 @@ impl BlitzServer {
     }
 
     pub fn engine(&self) -> &InMemoryTableEngine {
-        &self.engine
-    }
-
-    pub fn engine_mut(&mut self) -> &mut InMemoryTableEngine {
-        &mut self.engine
+        &*self.engine
     }
 
     pub fn tx_manager(&self) -> &TransactionManager {
         &self.tx_manager
+    }
+
+    /// Register a server-side procedure for `Op::Call` (replaces same name).
+    /// In-process only in v1: embedders/tests register at startup.
+    pub fn register_procedure(&self, proc: blitz_runtime::Procedure) {
+        if let Ok(mut g) = self.procedures.write() {
+            g.insert(proc.name.clone(), proc);
+        }
+    }
+
+    /// Fetch a registered procedure by name.
+    pub fn get_procedure(&self, name: &str) -> Option<blitz_runtime::Procedure> {
+        self.procedures.read().ok()?.get(name).cloned()
+    }
+
+    /// Call a pure-compute function (procedure steps delegate here).
+    pub fn call_function(
+        &self,
+        name: &str,
+        args: HashMap<String, Value>,
+    ) -> Result<Value, String> {
+        let g = self.functions.read().map_err(|e| format!("function registry locked: {}", e))?;
+        g.execute(name, args).map_err(|e| e.to_string())
     }
 
     pub fn event_emitter(&self) -> &EventEmitter {
@@ -539,6 +571,7 @@ impl BlitzServer {
             Op::Insert | Op::Update => Permission::Write,
             Op::Get | Op::Scan | Op::Find | Op::Subscribe | Op::Search => Permission::Read,
             Op::Delete => Permission::Delete,
+            Op::Call => Permission::Custom("call".to_string()),
             Op::Ping => return Ok(()),
         };
         let id = ident.as_ref().ok_or("unauthorized: authentication required")?;

@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use blitz_core::TableEngine;
-use blitz_protocol::{BatchResponse, FrameCodec, Incoming, Op, Request, Response, RowView};
+use blitz_protocol::{BatchRequest, BatchResponse, FrameCodec, Incoming, Op, Request, Response, RowView};
 use blitz_types::id::RowId;
 use blitz_types::row::Row;
 use blitz_types::value::Value;
@@ -249,7 +249,7 @@ fn apply_window(len: usize, ids_asc: bool, w: &ScanWindow, id_at: &dyn Fn(usize)
 /// Plain retried Inserts without `_idem` may duplicate. Interactive
 /// transactions (begin/commit over TCP) are not yet exposed; `active_tx`
 /// reports 0 honestly.
-fn dispatch(server: &BlitzServer, req: Request) -> Response {
+fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Request) -> Response {
     let id = req.id;
     match req.op {
         Op::Ping => Response::ok(id, Vec::new()),
@@ -498,9 +498,569 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
             }
             Response::ok(id, rows)
         }
+        Op::Call => execute_procedure(server, authed, req),
     }
 }
 
+/// Atomic batch execution: all ops run in ONE OCC transaction
+/// ([`IsolationLevel::RepeatableRead`]) and commit together — all responses
+/// ok, or every response err and nothing applied.
+///
+/// Supported ops: Ping (no-op ok), Get (versioned read), Insert, Update,
+/// Delete. Snapshot ops (Scan/Find/Subscribe/Search) bypass tx versioning
+/// and are rejected loudly (whole batch aborts) rather than silently
+/// breaking the atomicity contract.
+///
+/// Guarantees and residuals (honest, documented in PROTOCOL.md):
+/// - OCC validation closes write-write and read-write races pre-apply, so
+///   on unique-free tables (all app social tables) apply is infallible
+///   given the op-time existence pre-checks: TRUE atomicity.
+/// - Unique-constrained tables: sequential intra-batch duplicates abort
+///   pre-commit (checked); concurrent cross-batch duplicate races can both
+///   commit (same as the non-atomic path today — strictly no worse).
+/// - WAL append happens post-commit per applied write; a WAL failure then
+///   cannot roll back (memory-committed). It bumps `wal_dropped` and the
+///   row stays durable-in-memory until the next snapshot — responses stay
+///   ok because the data IS committed. Admission-time backpressure still
+///   sheds whole frames before `begin` (unchanged path).
+/// - `_idem` per insert works: a retried identical batch hits the cache on
+///   every op, commits an empty tx, and returns the original IDs.
+/// - `skip_validation` is NOT honored here (tx apply always validates):
+///   atomic batches trade ~µs/op for the guarantee. Measured, not hidden.
+fn execute_atomic(
+    server: &BlitzServer,
+    authed: &mut Option<blitz_auth::Identity>,
+    batch: BatchRequest,
+) -> BatchResponse {
+    use blitz_tx::transaction::IsolationLevel;
+    let batch_id = batch.id;
+    let op_ids: Vec<u64> = batch.ops.iter().map(|op| op.id).collect();
+    let abort_all = |msg: String| BatchResponse {
+        id: batch_id,
+        results: op_ids.iter().map(|rid| Response::err(*rid, msg.clone())).collect(),
+    };
+
+    // Phase 0: auth every op first (mirrors the batch path incl. handshake).
+    // A denial aborts the whole batch before any engine state is touched.
+    let mut ops = batch.ops;
+    for op in ops.iter_mut() {
+        if let Some(tok) = take_auth_token(&mut op.values) {
+            if let Some(id) = server.resolve_token(&tok) {
+                *authed = Some(id);
+            }
+        }
+        if let Err(e) = server.authorize(authed, op.op, &op.table) {
+            return abort_all(format!("atomic batch aborted: unauthorized op {}: {}", op.id, e));
+        }
+        // Snapshot ops would read outside tx versioning, and nested Calls
+        // would nest transactions: reject, don't fake.
+        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call) {
+            return abort_all(format!(
+                "atomic batch aborted: {:?} not supported in atomic batch",
+                op.op
+            ));
+        }
+    }
+
+    // Phase 1: buffer. Gets read (recording versions); writes buffer.
+    // Existence pre-checks double as read-set population for RR validation.
+    enum Buffered {
+        Ping,
+        Get { view: RowView },
+        Insert { values: std::collections::HashMap<String, Value>, idem: Option<String> },
+        Update { table: String, id: RowId },
+        Delete { table: String, id: RowId },
+    }
+    let mut tx = server.tx_manager().begin(IsolationLevel::RepeatableRead);
+    let mut buffered: Vec<(u64, Buffered)> = Vec::with_capacity(ops.len());
+    // Intra-batch duplicate guard for unique-constrained tables: two inserts
+    // with the same unique value in ONE batch would fail mid-drain (partial
+    // apply). Check pre-commit, abort cleanly. Keyed (table, column, value).
+    let mut seen_uniques: std::collections::HashSet<(String, String, String)> =
+        std::collections::HashSet::new();
+    // `fail` takes the tx explicitly so the borrow ends at the call site.
+    let fail = |tx: &mut blitz_tx::Transaction, rid: u64, msg: String| {
+        let _ = server.tx_manager().rollback(tx);
+        abort_all(format!("atomic batch aborted: op {}: {}", rid, msg))
+    };
+
+    for op in ops {
+        let rid = op.id;
+        match op.op {
+            Op::Ping => buffered.push((rid, Buffered::Ping)),
+            Op::Get => {
+                let row_id = match op.row_id {
+                    Some(r) => RowId::new(r),
+                    None => return fail(&mut tx, rid, "get requires row_id".to_string()),
+                };
+                match server.tx_manager().get(&mut tx, &op.table, row_id) {
+                    Ok(Some(row)) => buffered.push((rid, Buffered::Get { view: row_to_view(row_id, &row) })),
+                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", row_id)),
+                    Err(e) => return fail(&mut tx, rid, e.to_string()),
+                }
+            }
+            Op::Insert => {
+                let mut values = match op.values {
+                    Some(v) => v,
+                    None => return fail(&mut tx, rid, "insert requires values".to_string()),
+                };
+                if op.table.starts_with("media") {
+                    if let Some(Value::Bytes(b)) = values.get("blob") {
+                        if b.len() > 262_144 {
+                            return fail(&mut tx, rid, "blob too large (max 256KiB)".to_string());
+                        }
+                    }
+                }
+                let idem: Option<String> = values.remove("_idem").and_then(|v| match v {
+                    Value::String(s) => Some(s),
+                    _ => None,
+                });
+                // Idempotent retry: already-committed insert replays its ID,
+                // contributes no write to this commit.
+                if let Some(key) = idem.as_deref() {
+                    if let Some(cached) = server.idem_lookup(key) {
+                        buffered.push((rid, Buffered::Get {
+                            view: RowView { id: cached, values: values.clone() },
+                        }));
+                        continue;
+                    }
+                }
+                // Intra-batch duplicate pre-check against live unique indexes.
+                // Engine owns the index truth; ask it per unique column.
+                if let Ok(schema) = server.engine().schema(&op.table) {
+                    for col in schema.columns.iter().filter(|c| c.unique) {
+                        if let Some(v) = values.get(&col.name) {
+                            let key = (op.table.clone(), col.name.clone(), format!("{:?}", v));
+                            if !seen_uniques.insert(key) {
+                                return fail(
+                                    &mut tx,
+                                    rid,
+                                    format!("duplicate value in batch for unique {}.{}", op.table, col.name),
+                                );
+                            }
+                            if server.engine().lookup_by_unique(&op.table, &col.name, v).ok().flatten().is_some() {
+                                return fail(
+                                    &mut tx,
+                                    rid,
+                                    format!("duplicate value for unique {}.{}", op.table, col.name),
+                                );
+                            }
+                        }
+                    }
+                }
+                let mut row = Row::new(RowId::new(0));
+                for (k, v) in &values {
+                    row.set(k.clone(), v.clone());
+                }
+                if let Err(e) = tx.insert(op.table.clone(), row) {
+                    return fail(&mut tx, rid, e.to_string());
+                }
+                buffered.push((rid, Buffered::Insert { values, idem }));
+            }
+            Op::Update => {
+                let row_id = match op.row_id {
+                    Some(r) => RowId::new(r),
+                    None => return fail(&mut tx, rid, "update requires row_id".to_string()),
+                };
+                let values = match op.values {
+                    Some(v) => v,
+                    None => return fail(&mut tx, rid, "update requires values".to_string()),
+                };
+                // Read-before-write: existence check + read-set entry, so a
+                // concurrent writer aborts us at commit instead of clobbering.
+                match server.tx_manager().get(&mut tx, &op.table, row_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", row_id)),
+                    Err(e) => return fail(&mut tx, rid, e.to_string()),
+                }
+                if let Err(e) = tx.update(op.table.clone(), row_id, values) {
+                    return fail(&mut tx, rid, e.to_string());
+                }
+                buffered.push((rid, Buffered::Update { table: op.table, id: row_id }));
+            }
+            Op::Delete => {
+                let row_id = match op.row_id {
+                    Some(r) => RowId::new(r),
+                    None => return fail(&mut tx, rid, "delete requires row_id".to_string()),
+                };
+                match server.tx_manager().get(&mut tx, &op.table, row_id) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", row_id)),
+                    Err(e) => return fail(&mut tx, rid, e.to_string()),
+                }
+                if let Err(e) = tx.delete(op.table.clone(), row_id) {
+                    return fail(&mut tx, rid, e.to_string());
+                }
+                buffered.push((rid, Buffered::Delete { table: op.table, id: row_id }));
+            }
+            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call => {
+                return fail(&mut tx, rid, format!("{:?} not supported in atomic batch", op.op))
+            }
+        }
+    }
+
+    // Phase 2: commit. Conflict or apply error rolls back: nothing applied.
+    let touched = match server.tx_manager().commit(&mut tx) {
+        Ok(t) => t,
+        Err(e) => {
+            return BatchResponse {
+                id: batch_id,
+                results: buffered
+                    .iter()
+                    .map(|(rid, _)| Response::err(*rid, format!("atomic batch aborted: {}", e)))
+                    .collect(),
+            };
+        }
+    };
+    let mut touch_iter = touched.into_iter();
+
+    // Phase 3: responses + post-commit side effects (WAL, change-log, social
+    // derived state) mirroring dispatch, per applied write in buffer order.
+    // WAL failures here bump wal_dropped (memory-committed, documented).
+    let mut results = Vec::with_capacity(buffered.len());
+    for (rid, b) in buffered {
+        match b {
+            Buffered::Ping => results.push(Response::ok(rid, Vec::new())),
+            Buffered::Get { view } => results.push(Response::ok(rid, vec![view])),
+            Buffered::Insert { values, idem } => {
+                let (table, assigned) = match touch_iter.next() {
+                    Some(t) => t,
+                    None => {
+                        results.push(Response::err(rid, "atomic batch aborted: commit/response mismatch"));
+                        continue;
+                    }
+                };
+                emit_write_effects(
+                    server,
+                    &table,
+                    blitz_wal::EntryType::Insert,
+                    assigned.as_u64(),
+                    Some(&values),
+                );
+                if let Some(key) = idem {
+                    server.idem_record(key, assigned.as_u64());
+                }
+                results.push(Response::ok(rid, vec![RowView { id: assigned.as_u64(), values }]));
+            }
+            Buffered::Update { table, id } => {
+                match touch_iter.next() {
+                    Some(_) => {}
+                    None => {
+                        results.push(Response::err(rid, "atomic batch aborted: commit/response mismatch"));
+                        continue;
+                    }
+                }
+                match server.engine().get_arc(&table, id) {
+                    Ok(Some(row)) => {
+                        emit_write_effects(
+                            server,
+                            &table,
+                            blitz_wal::EntryType::Update,
+                            id.as_u64(),
+                            Some(&row.values),
+                        );
+                        results.push(Response::ok(rid, vec![row_to_view(id, &row)]));
+                    }
+                    _ => results.push(Response::err(rid, format!("row not found after commit: {}", id))),
+                }
+            }
+            Buffered::Delete { table, id } => {
+                match touch_iter.next() {
+                    Some(_) => {}
+                    None => {
+                        results.push(Response::err(rid, "atomic batch aborted: commit/response mismatch"));
+                        continue;
+                    }
+                }
+                emit_write_effects(server, &table, blitz_wal::EntryType::Delete, id.as_u64(), None);
+                results.push(Response::ok(rid, Vec::new()));
+            }
+        }
+    }
+    BatchResponse { id: batch_id, results }
+}
+
+/// Transaction backend for procedure calls: buffers every DB step in one
+/// OCC transaction (invoker-rights: each step re-authorizes the caller's
+/// table permission, so a callable procedure can't exceed what the caller
+/// could do op-by-op — no privilege escalation in v1).
+struct ProcBackend<'s> {
+    server: &'s BlitzServer,
+    ident: Option<blitz_auth::Identity>,
+    tx: blitz_tx::Transaction,
+    /// Buffered writes in order with pre-commit values for post-commit
+    /// effects + `_applied` reporting.
+    writes: Vec<ProcWrite>,
+    seen_uniques: std::collections::HashSet<(String, String, String)>,
+}
+
+struct ProcWrite {
+    table: String,
+    entry: blitz_wal::EntryType,
+    values: Option<std::collections::HashMap<String, Value>>,
+}
+
+impl<'s> ProcBackend<'s> {
+    fn deny(&self, op: Op, table: &str) -> Result<(), String> {
+        self.server.authorize(&self.ident, op, table).map_err(|e| e.to_string())
+    }
+
+    fn check_unique(
+        &mut self,
+        table: &str,
+        values: &std::collections::HashMap<String, Value>,
+    ) -> Result<(), String> {
+        if let Ok(schema) = self.server.engine().schema(table) {
+            for col in schema.columns.iter().filter(|c| c.unique) {
+                if let Some(v) = values.get(&col.name) {
+                    let key = (table.to_string(), col.name.clone(), format!("{:?}", v));
+                    if !self.seen_uniques.insert(key) {
+                        return Err(format!(
+                            "duplicate value in call for unique {}.{}",
+                            table, col.name
+                        ));
+                    }
+                    if self
+                        .server
+                        .engine()
+                        .lookup_by_unique(table, &col.name, v)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        return Err(format!("duplicate value for unique {}.{}", table, col.name));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
+    fn read(
+        &mut self,
+        table: &str,
+        id: u64,
+    ) -> blitz_runtime::RuntimeResult<Option<std::collections::HashMap<String, Value>>> {
+        use blitz_runtime::RuntimeError;
+        self.deny(Op::Get, table).map_err(RuntimeError::ExecutionError)?;
+        let row = self
+            .server
+            .tx_manager()
+            .get(&mut self.tx, table, RowId::new(id))
+            .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        Ok(row.map(|r| r.values))
+    }
+
+    fn insert(
+        &mut self,
+        table: &str,
+        values: std::collections::HashMap<String, Value>,
+    ) -> blitz_runtime::RuntimeResult<()> {
+        use blitz_runtime::RuntimeError;
+        self.deny(Op::Insert, table).map_err(RuntimeError::ExecutionError)?;
+        if table.starts_with("media") {
+            if let Some(Value::Bytes(b)) = values.get("blob") {
+                if b.len() > 262_144 {
+                    return Err(RuntimeError::ExecutionError("blob too large (max 256KiB)".into()));
+                }
+            }
+        }
+        self.check_unique(table, &values).map_err(RuntimeError::ExecutionError)?;
+        let mut row = Row::new(RowId::new(0));
+        for (k, v) in &values {
+            row.set(k.clone(), v.clone());
+        }
+        self.tx
+            .insert(table.to_string(), row)
+            .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        self.writes.push(ProcWrite {
+            table: table.to_string(),
+            entry: blitz_wal::EntryType::Insert,
+            values: Some(values),
+        });
+        Ok(())
+    }
+
+    fn update(
+        &mut self,
+        table: &str,
+        id: u64,
+        values: std::collections::HashMap<String, Value>,
+    ) -> blitz_runtime::RuntimeResult<()> {
+        use blitz_runtime::RuntimeError;
+        self.deny(Op::Update, table).map_err(RuntimeError::ExecutionError)?;
+        // Read-before-write: existence + read-set entry (concurrent writer
+        // aborts us at commit instead of clobbering).
+        let exists = self
+            .server
+            .tx_manager()
+            .get(&mut self.tx, table, RowId::new(id))
+            .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        if exists.is_none() {
+            return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id)));
+        }
+        self.tx
+            .update(table.to_string(), RowId::new(id), values.clone())
+            .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        self.writes.push(ProcWrite {
+            table: table.to_string(),
+            entry: blitz_wal::EntryType::Update,
+            values: Some(values),
+        });
+        Ok(())
+    }
+
+    fn delete(&mut self, table: &str, id: u64) -> blitz_runtime::RuntimeResult<()> {
+        use blitz_runtime::RuntimeError;
+        self.deny(Op::Delete, table).map_err(RuntimeError::ExecutionError)?;
+        let exists = self
+            .server
+            .tx_manager()
+            .get(&mut self.tx, table, RowId::new(id))
+            .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        if exists.is_none() {
+            return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id)));
+        }
+        self.tx
+            .delete(table.to_string(), RowId::new(id))
+            .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        self.writes.push(ProcWrite {
+            table: table.to_string(),
+            entry: blitz_wal::EntryType::Delete,
+            values: None,
+        });
+        Ok(())
+    }
+
+    fn call_function(
+        &self,
+        name: &str,
+        args: std::collections::HashMap<String, Value>,
+    ) -> blitz_runtime::RuntimeResult<Value> {
+        self.server
+            .call_function(name, args)
+            .map_err(blitz_runtime::RuntimeError::ExecutionError)
+    }
+}
+
+/// Execute a registered procedure in one OCC transaction (all-or-nothing).
+/// `req.table` is `fn:<name>` (policy resource); `req.values` are call args.
+/// Responds one row: the `Return` value (`{"result": v}`, or a `Json` object
+/// flattened) plus `_applied` (per-write `{table, id}` in buffer order).
+fn execute_procedure(
+    server: &BlitzServer,
+    authed: &Option<blitz_auth::Identity>,
+    req: Request,
+) -> Response {
+    use blitz_tx::transaction::IsolationLevel;
+    let id = req.id;
+    let name = match req.table.strip_prefix("fn:") {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => return Response::err(id, "call requires table `fn:<procedure>`"),
+    };
+    let proc = match server.get_procedure(&name) {
+        Some(p) => p,
+        None => return Response::err(id, format!("procedure not found: {}", name)),
+    };
+    let args = req.values.unwrap_or_default();
+    let mut backend = ProcBackend {
+        server,
+        ident: authed.clone(),
+        tx: server.tx_manager().begin(IsolationLevel::RepeatableRead),
+        writes: Vec::new(),
+        seen_uniques: std::collections::HashSet::new(),
+    };
+    let output = match blitz_runtime::run_procedure(&mut backend, &proc, args, blitz_runtime::DEFAULT_FUEL) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = server.tx_manager().rollback(&mut backend.tx);
+            return Response::err(id, format!("procedure aborted: {}", e));
+        }
+    };
+    let touched = match server.tx_manager().commit(&mut backend.tx) {
+        Ok(t) => t,
+        Err(e) => return Response::err(id, format!("procedure aborted: {}", e)),
+    };
+    // Zip commit-assigned ids back onto buffered writes in order.
+    let mut applied: Vec<serde_json::Value> = Vec::with_capacity(backend.writes.len());
+    for (w, (_, assigned)) in backend.writes.iter().zip(touched.iter()) {
+        emit_write_effects(server, &w.table, w.entry, assigned.as_u64(), w.values.as_ref());
+        applied.push(serde_json::json!({"table": w.table, "id": assigned.as_u64()}));
+    }
+    let mut values: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    match output.value {
+        Value::Json(serde_json::Value::Object(map)) => {
+            for (k, v) in map {
+                values.insert(k, json_to_value(v));
+            }
+        }
+        v => {
+            values.insert("result".to_string(), v);
+        }
+    }
+    values.insert("_applied".to_string(), Value::Json(serde_json::Value::Array(applied)));
+    Response::ok(id, vec![RowView { id: 0, values }])
+}
+
+/// Best-effort JSON → Value for `Return` object flattening. Scalars map
+/// natively; nested structures ride through as `Json`.
+fn json_to_value(v: serde_json::Value) -> Value {
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Boolean(b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Int64(i)
+            } else if let Some(u) = n.as_u64() {
+                Value::UInt64(u)
+            } else if let Some(f) = n.as_f64() {
+                Value::Float64(f)
+            } else {
+                Value::Json(serde_json::Value::Number(n))
+            }
+        }
+        serde_json::Value::String(s) => Value::String(s),
+        other => Value::Json(other),
+    }
+}
+
+/// Post-commit write effects shared by atomic batches and procedures:
+/// WAL append, change-log record, and social derived state (search index +
+/// fanout for `posts*` inserts). WAL failure bumps `wal_dropped` inside
+/// `wal_log` — the row is memory-committed (responses stay ok), durable at
+/// the next snapshot.
+fn emit_write_effects(
+    server: &BlitzServer,
+    table: &str,
+    entry: blitz_wal::EntryType,
+    row_id: u64,
+    values: Option<&std::collections::HashMap<String, Value>>,
+) {
+    let data = values.map(crate::durability::values_to_json_bytes).unwrap_or_default();
+    if server.wal_log(entry, table, row_id, data).is_err() {
+        // Committed but unwritten: counted, stays until snapshot.
+    }
+    let op = match entry {
+        blitz_wal::EntryType::Insert => "insert",
+        blitz_wal::EntryType::Update => "update",
+        blitz_wal::EntryType::Delete => "delete",
+        _ => "write",
+    };
+    server.record_change(table, op, row_id);
+    if table.starts_with("posts") && matches!(entry, blitz_wal::EntryType::Insert) {
+        if let Some(v) = values {
+            if let Some(Value::String(body)) = v.get("body") {
+                server.index_post(table, row_id, body);
+            }
+            if let Some(Value::String(author)) = v.get("author") {
+                server.fanout_enqueue(table.to_string(), row_id, author.clone());
+            }
+        }
+    }
+}
+///
 /// Zero-copy fast paths for the Single-frame hot path.
 ///
 /// `dispatch` must return an owned `Response` (Batch needs it), which forces
@@ -688,7 +1248,7 @@ async fn handle_stream(
                     } else if req.op == Op::Scan {
                         encode_scan_fast(&server, &codec, &req).context("encode error")?
                     } else {
-                        let resp = dispatch(&server, req);
+                        let resp = dispatch(&server, &authed, req);
                         // A giant response could exceed the frame budget;
                         // report it as an error payload instead of killing
                         // the connection.
@@ -723,7 +1283,7 @@ async fn handle_stream(
                             }
                             match server.authorize(&authed, op.op, &op.table) {
                                 Err(e) => results.push(Response::err(op.id, e)),
-                                Ok(()) => results.push(dispatch(&server, op)),
+                                Ok(()) => results.push(dispatch(&server, &authed, op)),
                             }
                         }
                         let bresp = BatchResponse {
@@ -735,6 +1295,26 @@ async fn handle_stream(
                             Err(_) => {
                                 let err = Response::err(
                                     batch.id,
+                                    "batch response too large",
+                                );
+                                codec.encode_response(&err).context("encode error")?
+                            }
+                        }
+                    }
+                }
+                Incoming::AtomicBatch(batch) => {
+                    // One OCC transaction for the whole frame: all-or-nothing.
+                    // Same 4096-op bound as Batch (per-frame CPU).
+                    if batch.ops.len() > 4096 {
+                        let err = Response::err(batch.id, "batch too large (max 4096 ops)");
+                        codec.encode_response(&err).context("encode error")?
+                    } else {
+                        let bresp = execute_atomic(&server, &mut authed, batch);
+                        match codec.encode_batch_response(&bresp) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                let err = Response::err(
+                                    bresp.id,
                                     "batch response too large",
                                 );
                                 codec.encode_response(&err).context("encode error")?
@@ -1010,6 +1590,25 @@ mod tests {
         let frame = client
             .codec
             .encode_batch_request(&BatchRequest { id, ops })?;
+        client.write.write_all(&frame).await?;
+        loop {
+            if let Some(payload) = client.codec.feed(&mut client.buf)? {
+                return Ok(client.codec.decode_batch_response(payload)?);
+            }
+            let n = client.read.read_buf(&mut client.buf).await?;
+            assert!(n > 0, "server closed connection unexpectedly");
+        }
+    }
+
+    async fn roundtrip_atomic(
+        client: &mut Client,
+        id: u64,
+        ops: Vec<Request>,
+    ) -> Result<BatchResponse> {
+        use blitz_protocol::BatchRequest;
+        let frame = client
+            .codec
+            .encode_atomic_batch_request(&BatchRequest { id, ops })?;
         client.write.write_all(&frame).await?;
         loop {
             if let Some(payload) = client.codec.feed(&mut client.buf)? {
@@ -1638,6 +2237,381 @@ mod tests {
         assert!(!b.results[0].ok, "dup must fail");
         assert!(b.results[1].ok, "sibling must commit despite partial failure");
         assert_eq!(server.engine().count("users").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_batch_commits_all_or_nothing() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Seed one row; learn its assigned id.
+        let seed = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("name", Value::String("Seed".into())),
+                    ("email", Value::String("seed@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(seed.ok);
+        let seed_id = seed.rows[0].id;
+
+        // Atomic checkout-style frame: read seed, update it, insert an order.
+        let b = roundtrip_atomic(&mut client, 50, vec![
+            Request {
+                id: 51,
+                op: Op::Get,
+                table: "users".into(),
+                row_id: Some(seed_id),
+                values: None,
+            },
+            Request {
+                id: 52,
+                op: Op::Update,
+                table: "users".into(),
+                row_id: Some(seed_id),
+                values: Some(values(&[("name", Value::String("Reserved".into()))])),
+            },
+            Request {
+                id: 53,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(2)),
+                    ("name", Value::String("Fresh".into())),
+                    ("email", Value::String("fresh@example.com".into())),
+                ])),
+            },
+        ])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|r| r.ok), "all must commit: {:?}", b.results);
+        assert_eq!(b.results.len(), 3);
+        // Get saw the pre-commit row; update response carries the new name.
+        assert_eq!(
+            b.results[0].rows[0].values.get("name"),
+            Some(&Value::String("Seed".into()))
+        );
+        assert_eq!(
+            b.results[1].rows[0].values.get("name"),
+            Some(&Value::String("Reserved".into()))
+        );
+        assert_eq!(server.engine().count("users").unwrap(), 2);
+        let after = server.engine().get("users", RowId::new(seed_id)).unwrap().unwrap();
+        assert_eq!(after.get("name"), Some(&Value::String("Reserved".into())));
+    }
+
+    #[tokio::test]
+    async fn test_atomic_batch_aborts_on_conflict_nothing_applied() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Seed one row holding the taken email.
+        let seed = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("name", Value::String("Seed".into())),
+                    ("email", Value::String("taken@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(seed.ok);
+
+        // Atomic frame: [fresh insert (would succeed alone), dup insert].
+        // Both must err; the fresh row must NOT exist afterwards.
+        let b = roundtrip_atomic(&mut client, 50, vec![
+            Request {
+                id: 51,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(2)),
+                    ("name", Value::String("Fresh".into())),
+                    ("email", Value::String("fresh@example.com".into())),
+                ])),
+            },
+            Request {
+                id: 52,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(3)),
+                    ("name", Value::String("Dup".into())),
+                    ("email", Value::String("taken@example.com".into())),
+                ])),
+            },
+        ])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|r| !r.ok), "all must abort: {:?}", b.results);
+        assert_eq!(server.engine().count("users").unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_batch_rejects_snapshot_ops() {        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Scan inside an atomic frame: the whole frame aborts, nothing applies.
+        let b = roundtrip_atomic(&mut client, 50, vec![
+            Request {
+                id: 51,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("name", Value::String("Ghost".into())),
+                    ("email", Value::String("ghost@example.com".into())),
+                ])),
+            },
+            Request {
+                id: 52,
+                op: Op::Scan,
+                table: "users".into(),
+                row_id: None,
+                values: None,
+            },
+        ])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|r| !r.ok), "snapshot op must abort all: {:?}", b.results);
+        assert_eq!(server.engine().count("users").unwrap(), 0);
+    }
+
+    /// Checkout-style procedure used by the Call tests: read balance, branch,
+    /// insert order + mark charged atomically, or Fail (rolls everything back).
+    fn checkout_procedure() -> blitz_runtime::Procedure {
+        use blitz_runtime::{Procedure, ProcedureStep};
+        use blitz_types::value::Value;
+        let mut order_vals = std::collections::HashMap::new();
+        order_vals.insert("id".to_string(), Value::Int64(1));
+        order_vals.insert("account_id".to_string(), Value::String("$account_id".into()));
+        order_vals.insert("amount".to_string(), Value::String("$price".into()));
+        let mut mark_vals = std::collections::HashMap::new();
+        mark_vals.insert("status".to_string(), Value::String("charged".into()));
+        Procedure::new("checkout")
+            .with_step(ProcedureStep::Read {
+                table: "accounts".into(),
+                id: Value::String("$account_id".into()),
+                into: "a".into(),
+            })
+            .with_step(ProcedureStep::If {
+                condition: blitz_runtime::function::Condition::GreaterOrEqual(
+                    "a.balance".into(),
+                    Value::String("$price".into()),
+                ),
+                then_steps: vec![
+                    ProcedureStep::Insert {
+                        table: "orders".into(),
+                        values: order_vals,
+                        into: "order_id".into(),
+                    },
+                    ProcedureStep::Update {
+                        table: "accounts".into(),
+                        id: Value::String("$account_id".into()),
+                        values: mark_vals,
+                    },
+                    ProcedureStep::Return {
+                        value: Value::String("$order_id".into()),
+                    },
+                ],
+                else_steps: vec![ProcedureStep::Fail {
+                    message: "insufficient balance".into(),
+                }],
+            })
+    }
+
+    fn accounts_schema() -> blitz_types::schema::TableSchema {
+        use blitz_types::column::{ColumnDef, ColumnType};
+        use blitz_types::schema::TableSchema;
+        TableSchema::new("accounts")
+            .with_column(ColumnDef::new("id", ColumnType::Int64).primary_key())
+            .with_column(ColumnDef::new("balance", ColumnType::Int64))
+            .with_column(ColumnDef::new("status", ColumnType::String))
+    }
+
+    fn orders_schema() -> blitz_types::schema::TableSchema {
+        use blitz_types::column::{ColumnDef, ColumnType};
+        use blitz_types::schema::TableSchema;
+        TableSchema::new("orders")
+            .with_column(ColumnDef::new("id", ColumnType::Int64).primary_key())
+            .with_column(ColumnDef::new("account_id", ColumnType::Int64))
+            .with_column(ColumnDef::new("amount", ColumnType::Int64))
+    }
+
+    fn call_req(id: u64, name: &str, args: Vec<(&str, Value)>) -> Request {
+        Request {
+            id,
+            op: Op::Call,
+            table: format!("fn:{}", name),
+            row_id: None,
+            values: Some(values(&args)),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_call_checkout_happy_path() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        server.engine().create_table(accounts_schema()).unwrap();
+        server.engine().create_table(orders_schema()).unwrap();
+        server.register_procedure(checkout_procedure());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Seed an account with balance 100; learn its assigned id.
+        let seed = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "accounts".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("balance", Value::Int64(100)),
+                    ("status", Value::String("active".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(seed.ok);
+        let acct = seed.rows[0].id;
+
+        let r = client
+            .roundtrip(&call_req(2, "checkout", vec![
+                ("account_id", Value::Int64(acct as i64)),
+                ("price", Value::Int64(40)),
+            ]))
+            .await
+            .unwrap();
+        assert!(r.ok, "call failed: {:?}", r.error);
+        assert_eq!(r.rows.len(), 1);
+        // _applied reports both writes with real assigned ids, in order.
+        let applied = r.rows[0].values.get("_applied").expect("missing _applied");
+        let arr = match applied {
+            Value::Json(serde_json::Value::Array(a)) => a,
+            other => panic!("_applied not an array: {:?}", other),
+        };
+        assert_eq!(arr.len(), 2, "_applied: {:?}", arr);
+        assert_eq!(arr[0]["table"], serde_json::Value::String("orders".into()));
+        assert_eq!(arr[1]["table"], serde_json::Value::String("accounts".into()));
+        let order_id = arr[0]["id"].as_u64().expect("order id");
+
+        // State: account charged, order row holds the amount.
+        let after = server.engine().get("accounts", RowId::new(acct)).unwrap().unwrap();
+        assert_eq!(after.get("status"), Some(&Value::String("charged".into())));
+        let order = server.engine().get("orders", RowId::new(order_id)).unwrap().unwrap();
+        assert_eq!(order.get("amount"), Some(&Value::Int64(40)));
+    }
+
+    #[tokio::test]
+    async fn test_call_checkout_insufficient_balance_rolls_back() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        server.engine().create_table(accounts_schema()).unwrap();
+        server.engine().create_table(orders_schema()).unwrap();
+        server.register_procedure(checkout_procedure());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        let seed = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "accounts".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("balance", Value::Int64(10)),
+                    ("status", Value::String("active".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(seed.ok);
+        let acct = seed.rows[0].id;
+
+        let r = client
+            .roundtrip(&call_req(2, "checkout", vec![
+                ("account_id", Value::UInt64(acct)),
+                ("price", Value::Int64(40)),
+            ]))
+            .await
+            .unwrap();
+        assert!(!r.ok, "must abort, got {:?}", r.rows);
+        assert!(r.error.as_deref().unwrap_or("").contains("insufficient balance"), "err: {:?}", r.error);
+        // Nothing applied: status untouched, no order row.
+        let after = server.engine().get("accounts", RowId::new(acct)).unwrap().unwrap();
+        assert_eq!(after.get("status"), Some(&Value::String("active".into())));
+        assert_eq!(server.engine().count("orders").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_call_unknown_procedure_and_bad_resource() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        let r = client.roundtrip(&call_req(1, "nope", vec![])).await.unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("not found"), "got {:?}", r.error);
+
+        let bad = client
+            .roundtrip(&Request { id: 2, op: Op::Call, table: "users".into(), row_id: None, values: None })
+            .await
+            .unwrap();
+        assert!(!bad.ok && bad.error.as_deref().unwrap_or("").contains("fn:<procedure>"), "got {:?}", bad.error);
+    }
+
+    #[tokio::test]
+    async fn test_call_inside_atomic_batch_rejected() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        server.register_procedure(checkout_procedure());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        let b = roundtrip_atomic(&mut client, 50, vec![
+            call_req(51, "checkout", vec![("account_id", Value::Int64(1))]),
+        ])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|r| !r.ok), "nested call must abort: {:?}", b.results);
     }
 
     #[tokio::test]

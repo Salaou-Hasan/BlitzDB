@@ -372,7 +372,14 @@ async fn run_client_batched(
             batch_ops.push(req);
         }
         out.sent += n as u64;
-        let frame = codec.encode_batch_request(&BatchRequest { id: batch_no, ops: batch_ops })?;
+        // BLITZ_ATOMIC=1 sends each frame as an atomic batch (all-or-nothing)
+        // instead of a plain batch: same ops, OCC transaction per frame.
+        let atomic = std::env::var("BLITZ_ATOMIC").as_deref() == Ok("1");
+        let frame = if atomic {
+            codec.encode_atomic_batch_request(&BatchRequest { id: batch_no, ops: batch_ops })?
+        } else {
+            codec.encode_batch_request(&BatchRequest { id: batch_no, ops: batch_ops })?
+        };
         batch_no += 1;
         let t = Instant::now();
         match tokio::time::timeout(timeout, wr.write_all(&frame)).await {

@@ -44,6 +44,10 @@ pub struct Procedure {
 }
 
 /// A single step in a procedure.
+///
+/// `$var` references in any `Value::String` resolve against live variables
+/// (same convention as `CallFunction` args). DB steps run inside the
+/// caller's transaction via [`ProcedureBackend`](crate::ProcedureBackend).
 #[derive(Debug, Clone)]
 pub enum ProcedureStep {
     /// Call a function by name with arguments.
@@ -62,6 +66,42 @@ pub enum ProcedureStep {
         then_steps: Vec<ProcedureStep>,
         else_steps: Vec<ProcedureStep>,
     },
+    /// Read a row: stores each column as `<into>.<col>` plus `<into>.#id`
+    /// (the row id as `UInt64`). Missing row aborts the call.
+    Read {
+        table: String,
+        id: Value,
+        into: String,
+    },
+    /// Buffer an insert. `into` receives the assigned id as `UInt64` —
+    /// placeholder `0` DURING execution (ids are assigned at commit);
+    /// real ids are reported in the call response. Referencing a
+    /// just-inserted row by id in later steps is unsupported (v1).
+    Insert {
+        table: String,
+        values: HashMap<String, Value>,
+        into: String,
+    },
+    /// Buffer an update (read-before-write: missing row aborts).
+    Update {
+        table: String,
+        id: Value,
+        values: HashMap<String, Value>,
+    },
+    /// Buffer a delete (missing row aborts).
+    Delete {
+        table: String,
+        id: Value,
+    },
+    /// Return a value to the caller (ends execution). Non-`Json` values
+    /// arrive as `{"result": v}`; `Json` objects flatten scalar tops.
+    Return {
+        value: Value,
+    },
+    /// Abort the call with a message: server rolls everything back.
+    Fail {
+        message: String,
+    },
 }
 
 /// A condition that can be evaluated.
@@ -69,8 +109,15 @@ pub enum ProcedureStep {
 pub enum Condition {
     /// Variable equals a value.
     Equals(String, Value),
-    /// Variable is not null.
+    /// Variable does not equal a value.
+    NotEquals(String, Value),
+    /// Variable is not null (and present).
     IsNotNull(String),
+    /// Numeric/ordered `>=` via `Value`'s total order (Int64 vs Int64 in
+    /// practice; mixed types order by variant — keep operands same-typed).
+    GreaterOrEqual(String, Value),
+    /// Ordered `<` via `Value`'s total order (same-type operands).
+    LessThan(String, Value),
     /// All sub-conditions are true.
     All(Vec<Condition>),
     /// Any sub-condition is true.

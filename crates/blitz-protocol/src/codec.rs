@@ -46,14 +46,19 @@ pub const PROTOCOL_VERSION: u8 = 2;
 /// Payload kind tags (first byte of every payload).
 pub const KIND_REQUEST: u8 = 0x01;
 pub const KIND_BATCH_REQUEST: u8 = 0x02;
+/// Atomic batch: same layout as [`KIND_BATCH_REQUEST`], executed as one
+/// OCC transaction (all-or-nothing). New kind (not a version bump): old
+/// servers reject it loudly as unknown-kind; new servers accept both.
+pub const KIND_ATOMIC_BATCH_REQUEST: u8 = 0x03;
 pub const KIND_RESPONSE: u8 = 0x11;
 pub const KIND_BATCH_RESPONSE: u8 = 0x12;
 
-/// One decoded client frame: single or batch request.
+/// One decoded client frame: single, batch, or atomic-batch request.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Incoming {
     Single(Request),
     Batch(BatchRequest),
+    AtomicBatch(BatchRequest),
 }
 
 fn expect_kind(r: &mut Reader<'_>, want: u8) -> ProtocolResult<()> {
@@ -687,6 +692,19 @@ impl FrameCodec {
         self.frame(w.bytes())
     }
 
+    /// Serialize an atomic batch: identical layout to batch, different kind.
+    /// The server executes all ops in one OCC transaction (all-or-nothing).
+    pub fn encode_atomic_batch_request(&self, batch: &BatchRequest) -> ProtocolResult<Bytes> {
+        let mut w = Writer::with_capacity(batch.ops.len() * 128 + 16);
+        w.u8(KIND_ATOMIC_BATCH_REQUEST);
+        w.u64(batch.id);
+        w.u32(batch.ops.len() as u32);
+        for op in &batch.ops {
+            w.request_body(op);
+        }
+        self.frame(w.bytes())
+    }
+
     /// Serialize a response into a single framed buffer.
     pub fn encode_response(&self, resp: &Response) -> ProtocolResult<Bytes> {
         let mut w = Writer::new();
@@ -770,12 +788,13 @@ impl FrameCodec {
         Ok(req)
     }
 
-    /// Deserialize one incoming client frame: single or batch request.
+    /// Deserialize one incoming client frame: single, batch, or atomic-batch.
     pub fn decode_incoming(&self, frame: Bytes) -> ProtocolResult<Incoming> {
         let mut r = Reader::new(&frame);
-        let out = match r.u8()? {
+        let kind = r.u8()?;
+        let out = match kind {
             KIND_REQUEST => Incoming::Single(r.request_body()?),
-            KIND_BATCH_REQUEST => {
+            KIND_BATCH_REQUEST | KIND_ATOMIC_BATCH_REQUEST => {
                 let id = r.u64()?;
                 let count = r.u32()? as usize;
                 // Bound per-frame dispatch work before allocating/looping.
@@ -789,7 +808,12 @@ impl FrameCodec {
                 for _ in 0..count {
                     ops.push(r.request_body()?);
                 }
-                Incoming::Batch(BatchRequest { id, ops })
+                let batch = BatchRequest { id, ops };
+                if kind == KIND_ATOMIC_BATCH_REQUEST {
+                    Incoming::AtomicBatch(batch)
+                } else {
+                    Incoming::Batch(batch)
+                }
             }
             other => {
                 return Err(ProtocolError::DecodeError(format!(
@@ -915,7 +939,17 @@ mod tests {
 
         match codec.decode_incoming(payload).unwrap() {
             Incoming::Batch(back) => assert_eq!(back, batch),
-            Incoming::Single(_) => panic!("expected batch"),
+            other => panic!("expected batch, got {:?}", other),
+        }
+
+        // Atomic batches round-trip to AtomicBatch with identical layout.
+        let frame = codec.encode_atomic_batch_request(&batch).unwrap();
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&frame);
+        let payload = codec.feed(&mut buf).unwrap().expect("complete frame");
+        match codec.decode_incoming(payload).unwrap() {
+            Incoming::AtomicBatch(back) => assert_eq!(back, batch),
+            other => panic!("expected atomic batch, got {:?}", other),
         }
 
         // Single frames still route to Single.
@@ -925,7 +959,7 @@ mod tests {
         let payload = codec.feed(&mut buf).unwrap().expect("complete frame");
         match codec.decode_incoming(payload).unwrap() {
             Incoming::Single(req) => assert_eq!(req.id, 3),
-            Incoming::Batch(_) => panic!("expected single"),
+            other => panic!("expected single, got {:?}", other),
         }
 
         // Batch responses round-trip too.
