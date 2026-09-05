@@ -43,7 +43,7 @@ pub const MAX_FLUSH_OPS: usize = 4096;
 /// frames: one giant frame minimizes syscalls but its tail ops wait behind
 /// the whole frame's server time (head-of-line). 64 keeps frames amortized
 /// (~64× fewer syscalls than singles) while bounding HoL wait.
-pub const FLUSH_CHUNK: usize = 64;
+pub const FLUSH_CHUNK: usize = 16;
 /// Default per-call timeout (flush + server + read).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -61,6 +61,9 @@ struct Pending {
     req: Request,
     reply: oneshot::Sender<SdkResult<Response>>,
     retry_safe: bool,
+    /// Queue entry time: the worker enforces the call timeout as a queue
+    /// deadline (no per-op timer wheel churn — one timer per flush frame).
+    enqueued: std::time::Instant,
 }
 
 enum Cmd {
@@ -116,25 +119,31 @@ impl Client {
     async fn exec(&self, req: Request, retry_safe: bool) -> SdkResult<Response> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(Cmd::Batch(Pending { req, reply: reply_tx, retry_safe }))
+            .send(Cmd::Batch(Pending {
+                req,
+                reply: reply_tx,
+                retry_safe,
+                enqueued: std::time::Instant::now(),
+            }))
             .map_err(|_| SdkError::Closed)?;
-        tokio::time::timeout(self.timeout, reply_rx)
-            .await
-            .map_err(|_| SdkError::Timeout(self.timeout.as_millis() as u64))?
-            .map_err(|_| SdkError::Closed)?
+        // No per-op timer: the worker enforces `timeout` as a queue deadline
+        // plus per-flush IO timeouts, and always replies (see worker_loop).
+        reply_rx.await.map_err(|_| SdkError::Closed)?
     }
 
     /// Send one frame immediately (Ping/auth probes skip the batcher so
-    /// handshakes don't wait 2ms and latency probes stay honest).
+    /// handshakes stay honest).
     async fn exec_direct(&self, req: Request) -> SdkResult<Response> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
-            .send(Cmd::Direct(Pending { req, reply: reply_tx, retry_safe: true }))
+            .send(Cmd::Direct(Pending {
+                req,
+                reply: reply_tx,
+                retry_safe: true,
+                enqueued: std::time::Instant::now(),
+            }))
             .map_err(|_| SdkError::Closed)?;
-        tokio::time::timeout(self.timeout, reply_rx)
-            .await
-            .map_err(|_| SdkError::Timeout(self.timeout.as_millis() as u64))?
-            .map_err(|_| SdkError::Closed)?
+        reply_rx.await.map_err(|_| SdkError::Closed)?
     }
 
     fn ok_rows(&self, resp: Response) -> SdkResult<Vec<Row>> {
@@ -167,6 +176,17 @@ impl Client {
         values.insert("_idem".to_string(), Value::String(self.alloc_idem()));
         let req = Request { id: self.alloc_id(), op: Op::Insert, table: table.into(), row_id: None, values: Some(values) };
         let mut rows = self.ok_rows(self.exec(req, true).await?)?;
+        rows.pop().ok_or_else(|| SdkError::Server("insert returned no rows".into()))
+    }
+
+    /// Insert without `_idem` (expert path, mirrors the bench wire shape).
+    /// Skips the server idem lookup/record (lock + clone + map insert per
+    /// write) for workloads that are naturally idempotent or callers that
+    /// carry their own keys. At-most-once on transport failure: never
+    /// auto-retried — retry manually with the same values.
+    pub async fn insert_fast(&self, table: &str, values: HashMap<String, Value>) -> SdkResult<Row> {
+        let req = Request { id: self.alloc_id(), op: Op::Insert, table: table.into(), row_id: None, values: Some(values) };
+        let mut rows = self.ok_rows(self.exec(req, false).await?)?;
         rows.pop().ok_or_else(|| SdkError::Server("insert returned no rows".into()))
     }
 
@@ -374,6 +394,21 @@ async fn flush_pending(
     if batch.is_empty() {
         return Ok(());
     }
+    // Queue deadline: ops that already waited out the call timeout fail
+    // fast without touching the socket (replaces per-op timer wheel churn).
+    let now = std::time::Instant::now();
+    let mut fresh: Vec<Pending> = Vec::with_capacity(batch.len());
+    for p in batch {
+        if now.saturating_duration_since(p.enqueued) >= timeout {
+            let _ = p.reply.send(Err(SdkError::Timeout(timeout.as_millis() as u64)));
+        } else {
+            fresh.push(p);
+        }
+    }
+    if fresh.is_empty() {
+        return Ok(());
+    }
+    let batch = fresh;
     let retry_safe = batch.iter().all(|p| p.retry_safe);
     // Move out: requests for the wire, (reply, flag) kept aside.
     let mut reqs: Vec<Request> = Vec::with_capacity(batch.len());

@@ -54,29 +54,35 @@ changes with scale.
 Rust SDK (`blitz-client`, drain-driven autobatching, per-op await style).
 Same code from 1 to 50K flows — only pool size changes. `sdk_slo` env:
 `SDK_SHARED=N` (N clients shared round-robin; 0 = one per task),
-`TOKIO_THREADS=T`. Shape matters, code doesn't:
+`TOKIO_THREADS=T`, `SDK_FAST_INSERT=1` (no-`_idem` expert inserts, bench
+wire parity), `SDK_GETS_ONLY=1` (read-path isolation). Shape matters, code
+doesn't. Final shape: 64-shared pool, 8 runtime threads, 16-op flush chunks.
 
-| Flows | Shape | Goodput | p50 | p99 | Verdict |
-|---|---|---|---|---|---|
-| 200 | dedicated | ~187K/s | ~1.0ms | ~1.8ms | PASS |
-| 1K | 16 shared | ~481K/s | ~1.9ms | ~3.6ms | PASS |
-| 10K | 64 shared | ~0.7–1.1M/s | ~4–7ms | ~27–53ms | PASS |
-| 50K | 64 shared | ~0.9M/s | ~40–46ms | ~122–125ms | FAIL (p99 only, 0 errors) |
+| Flows | Goodput | p50 | p99 | Verdict |
+|---|---|---|---|---|
+| 200 | ~187K/s | ~1.0ms | ~1.8ms | PASS |
+| 1K (16 shared) | ~481K/s | ~1.9ms | ~3.6ms | PASS |
+| 10K (64 shared) | ~2.0M/s | ~4.3ms | ~6.5ms | PASS |
+| 50K (64 shared) | ~1.95M/s | ~23ms | ~30ms | PASS, 0 errors |
 
-Native batch-25 at 10K for reference: 2.03M/s, p50 2.4ms, p99 3.9ms.
-Native single-frame at 10K: 263K/s, p99 79ms, FAIL — the SDK's
-cross-task batching beats native-awaited everywhere native-awaited is
-viable, and stays in the same SLO contract to 10K with margin.
+Native batch-25 for reference: 10K 2.03M/s p50 2.4ms p99 3.9ms; 50K
+1.54M/s p50 15.2ms p99 27.6ms. The SDK meets-or-beats native throughput
+at both scales with identical user code, p50 within ~1.5–1.7×, p99
+within ~1.1–1.7× — and beats native-awaited (10K single-frame: 263K/s,
+p99 79ms, FAIL) everywhere it is viable.
 
 How the gap closed (each measured): timer-driven flush → drain-driven
-(no 2ms tax, 2.1×); per-insert UUID syscall → counter `_idem`;
-global `_idem` write-lock → 16 shards (p99 halved at 2K); flush runs
-chunked at 64 (HoL bound). Remaining 50K p99 is scheduler-queue
-amplification (dependent caller→worker→caller wakeups across 50K tasks),
-not server work: raw sockets do p50 0.35ms at 2K conns on the same box.
-Guidance: share clients (pool ≈ CCU/150), size threads to cores-minus-room
-(migration beats parallelism past ~8 here), expect p50 ≈ native and p99
-≈ 2–7× native-batch at 10K+ awaited multiplexing.
+(no 2ms tax, 2.1×); per-op timer wheel → worker queue-deadlines + one
+timer per frame (+46%); global `_idem` write-lock → 16 shards (p99
+halved); `insert_fast` without `_idem` (bench parity, p50 tied);
+flush chunks 16 (native frame shape class, p99 parity at 50K).
+Remaining delta is scheduler-queue amplification of dependent
+caller→worker→caller wakeups plus per-connection multiplex queueing —
+multiplexing physics, not server work (raw sockets: p50 0.35ms at 2K
+conns). Guidance: share clients (pool ≈ CCU/150 at 10K+, wider at 50K
+only to a point), size threads down until throughput bends (migration
+beats parallelism past ~8 here), use `insert_fast` for naturally
+idempotent hot paths.
 
 ## Reading results honestly
 

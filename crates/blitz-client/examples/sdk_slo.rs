@@ -53,8 +53,14 @@ async fn run() {
     let shared: usize = std::env::var("SDK_SHARED").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let pool: Vec<Client> = if shared > 0 {
         let mut v = Vec::with_capacity(shared);
+        // SDK_NO_TIMEOUT=1: unbounded waits (isolates timer-wheel churn).
+        let no_timeout = std::env::var("SDK_NO_TIMEOUT").as_deref() == Ok("1");
         for _ in 0..shared {
-            v.push(Client::connect(addr).await.unwrap());
+            v.push(if no_timeout {
+                Client::connect_with_timeout(addr, std::time::Duration::MAX).await.unwrap()
+            } else {
+                Client::connect(addr).await.unwrap()
+            });
         }
         v
     } else {
@@ -92,6 +98,8 @@ async fn run() {
                 }
             }
             b.wait().await;
+            // SDK_FAST_INSERT=1: insert_fast (no _idem — bench wire parity).
+            let fast = std::env::var("SDK_FAST_INSERT").as_deref() == Ok("1");
             for i in 0..ops {
                 let t = Instant::now();
                 // Alternate insert / get-back (get-your-own proves id mapping).
@@ -99,12 +107,19 @@ async fn run() {
                     let id = ids[i % ids.len()];
                     client.get(&table, id).await.map(|_| ())
                 } else if i % 2 == 0 || ids.is_empty() {
-                    client.insert(&table, kv(&[
+                    let vs = kv(&[
                         ("id", Value::Int64((c * 1000 + i) as i64)),
                         ("v", Value::String(format!("u{}-{}", c, i))),
-                    ])).await.map(|row| {
-                        ids.push(row.id);
-                    })
+                    ]);
+                    if fast {
+                        client.insert_fast(&table, vs).await.map(|row| {
+                            ids.push(row.id);
+                        })
+                    } else {
+                        client.insert(&table, vs).await.map(|row| {
+                            ids.push(row.id);
+                        })
+                    }
                 } else {
                     let id = ids[i % ids.len()];
                     client.get(&table, id).await.map(|_| ())
