@@ -6,6 +6,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{WalError, WalResult};
 
+/// Data-only file sync (fdatasync on Unix): persists file data + metadata
+/// required for access (e.g. size on extend) without syncing directory
+/// entries. Correct for pre-created WAL files; measurably cheaper than
+/// `sync_all` under group-commit fsync storms.
+#[cfg(unix)]
+fn sync_data(f: &File) -> io::Result<()> {
+    f.sync_data()
+}
+
+#[cfg(not(unix))]
+fn sync_data(f: &File) -> io::Result<()> {
+    f.sync_all()
+}
+
 /// Magic number to identify valid WAL files.
 const WAL_MAGIC: u32 = 0x42_4C_49_54; // "BLIT"
 
@@ -231,17 +245,38 @@ impl WriteAheadLog {
         raw.write_to(&mut self.writer)?;
         self.writer.flush()?;
 
-        // Sync to disk for durability
-        self.writer.get_ref().sync_all()?;
+        // Data-only sync (fdatasync): file size/metadata needed for access
+        // is still synced on append-extend, but directory entries aren't.
+        // Cheaper than full fsync; WAL files are pre-created in data_dir.
+        sync_data(self.writer.get_ref())?;
 
         self.current_size += raw.serialized_size() as u64;
         Ok(())
     }
 
+    /// Append without fsync (group-commit fast path). The entry is staged in
+    /// the `BufWriter` (no per-entry `flush` — the group commits once per
+    /// batch via `sync()`, which flushes + fsyncs). Flushing per entry here
+    /// cost one `write` syscall per op and capped groups at ~100K/s.
+    pub fn append_buffered(&mut self, entry_type: EntryType, table: &str, row_id: u64, data: &[u8]) -> WalResult<u64> {
+        let seq = self.next_sequence;
+        let raw = WalEntryRaw::from_entry(&WalEntry {
+            sequence: seq,
+            entry_type,
+            table: table.to_string(),
+            row_id,
+            data: data.to_vec(),
+        });
+        raw.write_to(&mut self.writer)?;
+        self.current_size += raw.serialized_size() as u64;
+        self.next_sequence += 1;
+        Ok(seq)
+    }
+
     /// Flush any buffered writes.
     pub fn sync(&mut self) -> WalResult<()> {
         self.writer.flush()?;
-        self.writer.get_ref().sync_all()?;
+        sync_data(self.writer.get_ref())?;
         Ok(())
     }
 

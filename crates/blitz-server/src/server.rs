@@ -12,7 +12,7 @@ use blitz_types::schema::TableSchema;
 use blitz_types::value::Value;
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     RwLock,
 };
 
@@ -25,6 +25,30 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub enable_auth: bool,
     pub max_message_size: usize,
+    /// Shed load when `connection_count >= shed_at_connections`.
+    /// `None` (default) disables shedding; admission still caps at
+    /// `max_connections`. Set to ~90% of max in prod so p99 degrades
+    /// via fast failures instead of unbounded queueing.
+    pub shed_at_connections: Option<usize>,
+    /// Count a response as "slow" when end-to-end handling exceeds this.
+    /// Used for p95/p99.9 alerting via `slow_responses()`.
+    pub slow_threshold_ms: u64,
+    /// Skip per-insert schema validation (shard/cache fast path).
+    /// Only for trusted app layers with fixed shape; untrusted clients must
+    /// leave this `false`. Saves 2-3 hash lookups per insert.
+    pub skip_validation: bool,
+    /// Durability mode. `None` (default) = in-memory only, current speed.
+    /// Set with `data_dir` for crash safety (see `durability`).
+    pub durability: crate::durability::DurabilityMode,
+    /// Snapshot every N seconds when durable (0 = disabled).
+    pub snapshot_secs: u64,
+    /// Close idle keep-alive connections after N seconds (0 = disabled).
+    /// Default 300s reaps slow-loris/FD leaks; benches hold <60s so unaffected.
+    pub idle_timeout_secs: u64,
+    /// Max connections per source IP (0 = unlimited). Default 20000: the
+    /// 8-IP bench harness stays under it at 50K (6250/IP); single-IP prod
+    /// clients should raise it, public endpoints lower it.
+    pub max_connections_per_ip: usize,
 }
 
 impl Default for ServerConfig {
@@ -36,8 +60,36 @@ impl Default for ServerConfig {
             max_connections: 200_000,
             enable_auth: true,
             max_message_size: 1_048_576,
+            shed_at_connections: None,
+            slow_threshold_ms: 50,
+            skip_validation: false,
+            durability: crate::durability::DurabilityMode::None,
+            snapshot_secs: 0,
+            idle_timeout_secs: 300,
+            max_connections_per_ip: 20_000,
         }
     }
+}
+
+/// Point-in-time server stats for alerting / shedding.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ServerStats {
+    pub connections: usize,
+    pub total_requests: u64,
+    pub slow_responses: u64,
+    pub shed_drops: u64,
+    pub bytes_read: u64,
+    pub bytes_written: u64,
+    /// Active transactions / conflicts / subscription fanout.
+    /// 0 today: tx/events/realtime are not on the TCP hot path yet.
+    /// Reported explicitly so SLO dashboards don't mistake missing for zero-load.
+    pub active_tx: u64,
+    pub tx_conflicts: u64,
+    pub subscription_fanout: u64,
+    /// WAL bytes/ops. 0 = durability `None` (in-memory). Group-commit mode
+    /// will fill these; NVMe IOPS then comes from `/proc/diskstats`.
+    pub wal_bytes: u64,
+    pub wal_ops: u64,
 }
 
 /// Main BlitzDB server instance.
@@ -55,6 +107,19 @@ pub struct BlitzServer {
     identities: RwLock<HashMap<String, Identity>>,
     connections: AtomicUsize,
     started_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
+    total_requests: std::sync::atomic::AtomicU64,
+    slow_responses: std::sync::atomic::AtomicU64,
+    shed_drops: std::sync::atomic::AtomicU64,
+    bytes_read: std::sync::atomic::AtomicU64,
+    bytes_written: std::sync::atomic::AtomicU64,
+    wal_dropped_full: std::sync::atomic::AtomicU64,
+    wal: RwLock<Option<crate::durability::WalCluster>>,
+    wal_rotating: AtomicBool,
+    /// Idempotency dedup: client `_idem` key → assigned RowId.
+    /// Bounded (256K, clears half when full); safe-retry for shed/timeout.
+    idem: RwLock<HashMap<String, u64>>,
+    /// Live connections per source IP for per-IP caps.
+    ips: std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
 }
 
 impl BlitzServer {
@@ -71,6 +136,16 @@ impl BlitzServer {
             identities: RwLock::new(HashMap::new()),
             connections: AtomicUsize::new(0),
             started_at: RwLock::new(None),
+            total_requests: std::sync::atomic::AtomicU64::new(0),
+            slow_responses: std::sync::atomic::AtomicU64::new(0),
+            shed_drops: std::sync::atomic::AtomicU64::new(0),
+            bytes_read: std::sync::atomic::AtomicU64::new(0),
+            bytes_written: std::sync::atomic::AtomicU64::new(0),
+            wal_dropped_full: std::sync::atomic::AtomicU64::new(0),
+            wal: RwLock::new(None),
+            wal_rotating: AtomicBool::new(false),
+            idem: RwLock::new(HashMap::new()),
+            ips: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -139,8 +214,250 @@ impl BlitzServer {
     }
 
     /// Release one previously acquired connection slot.
+    /// Saturating: a double-release (bug) can never underflow to
+    /// `usize::MAX` and wedge admission forever.
     pub fn release_connection(&self) {
-        self.connections.fetch_sub(1, Ordering::AcqRel);
+        // CAS loop with saturation: fetch_sub would wrap on double-release.
+        let mut current = self.connections.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                return;
+            }
+            match self.connections.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Record one dispatched request. Called by the transport hot path;
+    /// `slow` marks end-to-end handling past `slow_threshold_ms`.
+    pub fn record_request(&self, slow: bool) {
+        use std::sync::atomic::Ordering as O;
+        self.total_requests.fetch_add(1, O::Relaxed);
+        if slow {
+            self.slow_responses.fetch_add(1, O::Relaxed);
+        }
+    }
+
+    /// Whether to shed *new* connections fast instead of queueing.
+    /// Disabled (`None`) by default; set `shed_at_connections` in prod.
+    pub fn should_shed(&self) -> bool {
+        match self.config.shed_at_connections {
+            Some(t) => self.connection_count() >= t,
+            None => false,
+        }
+    }
+
+    pub fn record_shed_drop(&self) {
+        use std::sync::atomic::Ordering as O;
+        self.shed_drops.fetch_add(1, O::Relaxed);
+    }
+
+    pub fn record_io(&self, read_bytes: u64, written_bytes: u64) {
+        use std::sync::atomic::Ordering as O;
+        if read_bytes > 0 {
+            self.bytes_read.fetch_add(read_bytes, O::Relaxed);
+        }
+        if written_bytes > 0 {
+            self.bytes_written.fetch_add(written_bytes, O::Relaxed);
+        }
+    }
+
+    pub fn stats(&self) -> ServerStats {
+        use std::sync::atomic::Ordering as O;
+        let (wal_bytes, wal_ops) = match self.wal.read().ok().and_then(|g| (*g).clone()) {
+            Some(w) => (w.bytes_flushed(), w.ops_flushed()),
+            None => (0, 0),
+        };
+        ServerStats {
+            connections: self.connection_count(),
+            total_requests: self.total_requests.load(O::Relaxed),
+            slow_responses: self.slow_responses.load(O::Relaxed),
+            shed_drops: self.shed_drops.load(O::Relaxed),
+            bytes_read: self.bytes_read.load(O::Relaxed),
+            bytes_written: self.bytes_written.load(O::Relaxed),
+            active_tx: 0,
+            tx_conflicts: 0,
+            subscription_fanout: 0,
+            wal_bytes,
+            wal_ops,
+        }
+    }
+
+    /// Slow-response rate in [0,1] for alerting. `None` when no traffic.
+    pub fn slow_rate(&self) -> Option<f64> {
+        use std::sync::atomic::Ordering as O;
+        let total = self.total_requests.load(O::Relaxed);
+        if total == 0 {
+            return None;
+        }
+        Some(self.slow_responses.load(O::Relaxed) as f64 / total as f64)
+    }
+
+    /// Append a WAL record (non-blocking sharded group-commit). Ok(()) in
+    /// `None` mode or when queued; Err backpressure message when the target
+    /// shard group is full or a rotation is in progress (caller must fail
+    /// the request, not ack unwritten data).
+    pub fn wal_log(
+        &self,
+        entry: blitz_wal::EntryType,
+        table: &str,
+        row_id: u64,
+        data: Vec<u8>,
+    ) -> Result<(), String> {
+        use std::sync::atomic::Ordering as O;
+        if self.wal_rotating.load(O::Relaxed) {
+            self.wal_dropped_full.fetch_add(1, O::Relaxed);
+            return Err("WAL rotation in progress".to_string());
+        }
+        let cluster = match self.wal.read().ok().and_then(|g| (*g).clone()) {
+            Some(c) => c,
+            None => return Ok(()),
+        };
+        if !cluster.is_enabled() {
+            return Ok(());
+        }
+        cluster
+            .append(table, entry, row_id, data)
+            .map_err(|e| {
+                self.wal_dropped_full.fetch_add(1, O::Relaxed);
+                e
+            })
+    }
+
+    pub fn wal_dropped(&self) -> u64 {
+        use std::sync::atomic::Ordering as O;
+        self.wal_dropped_full.load(O::Relaxed)
+    }
+
+    /// Save a snapshot of all tables (durable modes; no-op without data_dir).
+    pub fn save_snapshot(&self) -> Result<Option<std::path::PathBuf>> {
+        match &self.config.data_dir {
+            Some(dir) => Ok(Some(crate::durability::save_snapshot(&self.engine, dir)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Snapshot + WAL rotation (bounds replay time). Quiesces appends
+    /// briefly: concurrent writes shed with backpressure during the window
+    /// (fail-fast, retryable via idempotency keys) instead of risking
+    /// truncate races. Returns snapshot path.
+    pub fn snapshot_and_rotate(&self) -> Result<std::path::PathBuf> {
+        use std::sync::atomic::Ordering as O;
+        let dir = self.config.data_dir.clone().ok_or_else(|| anyhow::anyhow!("no data_dir"))?;
+        // 1. Quiesce.
+        self.wal_rotating.store(true, O::Relaxed);
+        // 2. Drain groups.
+        if let Some(c) = self.wal.read().ok().and_then(|g| (*g).clone()) {
+            c.flush_all(std::time::Duration::from_secs(30));
+        }
+        // 3. Snapshot (engine is consistent; WAL drained).
+        let snap = crate::durability::save_snapshot(&self.engine, &dir)?;
+        // 4. Swap cluster: drop old senders (threads exit), delete shard
+        // files, open fresh. New appends after this get post-snapshot seqs.
+        {
+            let old = self.wal.write().unwrap().take();
+            drop(old);
+        }
+        for i in 0..crate::durability::WalCluster::shards_for_mode() {
+            let p = std::path::PathBuf::from(&dir).join(format!("wal_{:02}.log", i));
+            let _ = std::fs::remove_file(&p);
+        }
+        let _ = std::fs::remove_file(std::path::PathBuf::from(&dir).join("wal.log"));
+        if self.config.durability.is_durable() {
+            let cluster = crate::durability::WalCluster::open(&dir, self.config.durability)?;
+            if cluster.is_enabled() {
+                *self.wal.write().unwrap() = Some(cluster);
+            }
+        }
+        self.wal_rotating.store(false, O::Relaxed);
+        // Prune old snapshots, keep 3.
+        let mgr = blitz_snapshot::SnapshotManager::new(
+            std::path::PathBuf::from(&dir).join("snapshots"),
+        );
+        let _ = mgr.prune(3);
+        Ok(snap)
+    }
+
+    /// Idempotency: lookup cached RowId for a client `_idem` key.
+    pub fn idem_lookup(&self, key: &str) -> Option<u64> {
+        self.idem.read().ok().and_then(|g| g.get(key).copied())
+    }
+
+    /// Record `_idem` key → RowId. Bounded at 256K (clears half when full).
+    pub fn idem_record(&self, key: String, row_id: u64) {
+        if let Ok(mut g) = self.idem.write() {
+            if g.len() >= 256_000 {
+                let drop_n = g.len() / 2;
+                let keys: Vec<String> = g.keys().take(drop_n).cloned().collect();
+                for k in keys {
+                    g.remove(&k);
+                }
+            }
+            g.insert(key, row_id);
+        }
+    }
+
+    /// Admit one IP slot. False when per-IP cap hit (shed).
+    pub fn ip_acquire(&self, ip: std::net::IpAddr) -> bool {
+        let cap = self.config.max_connections_per_ip;
+        if cap == 0 {
+            return true;
+        }
+        match self.ips.lock() {
+            Ok(mut m) => {
+                let n = m.get(&ip).copied().unwrap_or(0);
+                if n >= cap {
+                    return false;
+                }
+                m.insert(ip, n + 1);
+                true
+            }
+            Err(_) => true,
+        }
+    }
+
+    pub fn ip_release(&self, ip: std::net::IpAddr) {
+        if let Ok(mut m) = self.ips.lock() {
+            if let Some(n) = m.get(&ip).copied() {
+                if n <= 1 {
+                    m.remove(&ip);
+                } else {
+                    m.insert(ip, n - 1);
+                }
+            }
+        }
+    }
+
+    /// Prometheus exposition for the SLO contract fields.
+    pub fn metrics_text(&self) -> String {
+        let s = self.stats();
+        let slow = self.slow_rate().unwrap_or(0.0);
+        let uptime = self.uptime_secs().unwrap_or(0.0);
+        format!(
+            "# HELP blitz_connections live connections\n# TYPE blitz_connections gauge\nblitz_connections {}\n\
+             # HELP blitz_requests_total dispatched frames\n# TYPE blitz_requests_total counter\nblitz_requests_total {}\n\
+             # HELP blitz_slow_responses_total frames past slow_threshold\n# TYPE blitz_slow_responses_total counter\nblitz_slow_responses_total {}\n\
+             # HELP blitz_slow_rate slow/total\n# TYPE blitz_slow_rate gauge\nblitz_slow_rate {:.4}\n\
+             # HELP blitz_shed_drops_total shed at admission\n# TYPE blitz_shed_drops_total counter\nblitz_shed_drops_total {}\n\
+             # HELP blitz_wal_dropped_total WAL backpressure drops\n# TYPE blitz_wal_dropped_total counter\nblitz_wal_dropped_total {}\n\
+             # HELP blitz_bytes_read_total TCP bytes read\n# TYPE blitz_bytes_read_total counter\nblitz_bytes_read_total {}\n\
+             # HELP blitz_bytes_written_total TCP bytes written\n# TYPE blitz_bytes_written_total counter\nblitz_bytes_written_total {}\n\
+             # HELP blitz_wal_bytes_total WAL bytes fsynced\n# TYPE blitz_wal_bytes_total counter\nblitz_wal_bytes_total {}\n\
+             # HELP blitz_wal_ops_total WAL ops fsynced\n# TYPE blitz_wal_ops_total counter\nblitz_wal_ops_total {}\n\
+             # HELP blitz_active_tx active transactions (0: auto-commit TCP)\n# TYPE blitz_active_tx gauge\nblitz_active_tx {}\n\
+             # HELP blitz_uptime_seconds server uptime\n# TYPE blitz_uptime_seconds gauge\nblitz_uptime_seconds {:.1}\n",
+            s.connections, s.total_requests, s.slow_responses, slow,
+            s.shed_drops, self.wal_dropped(),
+            s.bytes_read, s.bytes_written, s.wal_bytes, s.wal_ops,
+            s.active_tx, uptime,
+        )
     }
 
     /// Uptime in seconds.
@@ -151,12 +468,36 @@ impl BlitzServer {
     }
 
     /// Start the server with default schemas.
+    /// When `data_dir` + durable mode are configured, replays snapshot + WAL
+    /// before creating default schemas (existing tables win), then opens the
+    /// group-commit bridge for new writes.
     pub async fn start(&self) -> Result<()> {
         tracing::info!(
             "BlitzDB server starting on {}:{}",
             self.config.host,
             self.config.port
         );
+
+        // Crash recovery first so default schemas don't shadow restored ones
+        // with incompatible (strict vs inferred) definitions.
+        if let Some(dir) = self.config.data_dir.clone() {
+            if self.config.durability.is_durable() {
+                match crate::durability::recover(&self.engine, &dir) {
+                    Ok((tables, rows, replayed)) => tracing::info!(
+                        "recovery: tables={} rows={} wal_replayed={} dir={}",
+                        tables, rows, replayed, dir
+                    ),
+                    Err(e) => tracing::warn!("recovery failed (starting empty): {:#}", e),
+                }
+                let cluster = crate::durability::WalCluster::open(
+                    &dir,
+                    self.config.durability,
+                )?;
+                if cluster.is_enabled() {
+                    *self.wal.write().unwrap() = Some(cluster);
+                }
+            }
+        }
 
         let users_schema = TableSchema::new("users")
             .with_column(ColumnDef::new("id", ColumnType::Int64).primary_key())

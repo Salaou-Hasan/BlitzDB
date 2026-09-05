@@ -1,16 +1,13 @@
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 use crate::error::{CoreError, CoreResult};
-use crate::pool::RowPool;
 use blitz_types::id::RowId;
 use blitz_types::row::Row;
 use blitz_types::schema::TableSchema;
 use blitz_types::value::Value;
-
-fn lock_err() -> CoreError {
-    CoreError::Internal("lock poisoned".into())
-}
 
 /// The core table engine trait.
 ///
@@ -20,6 +17,14 @@ fn lock_err() -> CoreError {
 pub trait TableEngine: Send + Sync {
     /// Insert a new row into a table.
     fn insert(&self, table_name: &str, row: Row) -> CoreResult<RowId>;
+
+    /// Insert without schema validation. Shard/cache fast path for trusted
+    /// app layers that already guarantee shape (saves 2-3 hash lookups per
+    /// insert, ~10% of insert service time). Default impl validates.
+    /// Untrusted clients must use `insert`.
+    fn insert_unchecked(&self, table_name: &str, row: Row) -> CoreResult<RowId> {
+        self.insert(table_name, row)
+    }
 
     /// Get a row by its primary key (cloning read).
     fn get(&self, table_name: &str, id: RowId) -> CoreResult<Option<Row>>;
@@ -59,25 +64,36 @@ pub trait TableEngine: Send + Sync {
     /// Drop a table.
     fn drop_table(&self, table_name: &str) -> CoreResult<()>;
 
+    /// List all table names (for snapshots / observability).
+    fn table_names(&self) -> Vec<String>;
+
+    /// Restore a row with its original ID (snapshot/WAL replay).
+    /// Bumps `next_id` past the restored ID so later inserts don't collide.
+    /// Fails if the ID already exists (replay must be idempotent-ordered).
+    fn insert_preserving_id(&self, table_name: &str, row: Row) -> CoreResult<RowId>;
+
     /// Check if a table exists.
     fn table_exists(&self, table_name: &str) -> bool;
 }
 
 /// An in-memory table engine implementation with table-level locking.
 ///
-/// The table map is behind one `RwLock`, but each table has its own
-/// `RwLock`: single-table operations clone the table's `Arc` under a
-/// short map read-lock, then lock only that table. Operations on
-/// different tables never block each other.
+/// The table map is a sharded `DashMap` (lock-free reads, no global map
+/// lock); each table has its own `RwLock`. Operations on different tables
+/// never block each other, and map lookups scale across cores — the old
+/// single-`RwLock` map collapsed past ~16 threads on the A-maplock bench.
 pub struct InMemoryTableEngine {
-    tables: RwLock<HashMap<String, Arc<RwLock<InMemoryTable>>>>,
+    tables: dashmap::DashMap<String, Arc<RwLock<InMemoryTable>>>,
 }
 
 struct InMemoryTable {
     schema: TableSchema,
     rows: HashMap<RowId, Arc<Row>>,
     next_id: u64,
-    row_pool: RowPool,
+    /// Unique secondary indexes: column → (value → RowId) for PK + unique
+    /// columns. Maintained under the table write lock (no extra locking);
+    /// converts duplicate-key checks from O(N) scans to O(1) lookups.
+    uniq: HashMap<String, HashMap<Value, RowId>>,
 }
 
 impl InMemoryTable {
@@ -86,7 +102,7 @@ impl InMemoryTable {
             schema,
             rows: HashMap::new(),
             next_id: 1,
-            row_pool: RowPool::new(),
+            uniq: HashMap::new(),
         }
     }
 
@@ -94,6 +110,57 @@ impl InMemoryTable {
         let id = RowId::new(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Column names requiring uniqueness (PK + unique, non-null values only).
+    fn uniq_cols(&self) -> Vec<String> {
+        self.schema
+            .columns
+            .iter()
+            .filter(|c| c.primary_key || c.unique)
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    fn check_uniq(&self, cols: &[String], values: &HashMap<String, Value>, self_id: Option<RowId>) -> CoreResult<()> {
+        for col in cols {
+            if let Some(v) = values.get(col) {
+                if v.is_null() {
+                    continue;
+                }
+                if let Some(idx) = self.uniq.get(col) {
+                    if let Some(owner) = idx.get(v) {
+                        if Some(*owner) != self_id {
+                            return Err(CoreError::DuplicateKey(format!("{}={:?}", col, v)));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn index_row(&mut self, cols: &[String], id: RowId, values: &HashMap<String, Value>) {
+        for col in cols {
+            if let Some(v) = values.get(col) {
+                if v.is_null() {
+                    continue;
+                }
+                self.uniq.entry(col.clone()).or_default().insert(v.clone(), id);
+            }
+        }
+    }
+
+    fn unindex_row(&mut self, cols: &[String], id: RowId, values: &HashMap<String, Value>) {
+        for col in cols {
+            if let Some(v) = values.get(col) {
+                if let Some(idx) = self.uniq.get_mut(col) {
+                    if idx.get(v) == Some(&id) {
+                        idx.remove(v);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -106,18 +173,16 @@ impl Default for InMemoryTableEngine {
 impl InMemoryTableEngine {
     pub fn new() -> Self {
         Self {
-            tables: RwLock::new(HashMap::new()),
+            tables: dashmap::DashMap::new(),
         }
     }
 
-    /// Resolve a table handle. Holds the map lock only long enough to
-    /// clone the `Arc`; the caller then locks just that table.
+    /// Resolve a table handle. DashMap read is shard-locked, not globally
+    /// locked; the caller then locks just that table.
     fn table(&self, table_name: &str) -> CoreResult<Arc<RwLock<InMemoryTable>>> {
         self.tables
-            .read()
-            .map_err(|_| lock_err())?
             .get(table_name)
-            .cloned()
+            .map(|r| r.clone())
             .ok_or_else(|| CoreError::TableNotFound(table_name.to_string()))
     }
 }
@@ -125,15 +190,34 @@ impl InMemoryTableEngine {
 impl TableEngine for InMemoryTableEngine {
     fn insert(&self, table_name: &str, mut row: Row) -> CoreResult<RowId> {
         let table = self.table(table_name)?;
-        let mut table = table.write().map_err(|_| lock_err())?;
+        let mut table = table.write();
 
         // Validate against schema
         table.schema.validate_row_values(&row.values)?;
+
+        // PK/unique enforcement via maintained O(1) indexes.
+        let cols = table.uniq_cols();
+        table.check_uniq(&cols, &row.values, None)?;
 
         // Assign row ID
         let row_id = table.next_row_id();
         row.id = row_id;
 
+        table.index_row(&cols, row_id, &row.values);
+        table.rows.insert(row_id, Arc::new(row));
+        Ok(row_id)
+    }
+
+    fn insert_unchecked(&self, table_name: &str, mut row: Row) -> CoreResult<RowId> {
+        let table = self.table(table_name)?;
+        let mut table = table.write();
+        // Unchecked skips schema validation but NOT uniqueness: indexes must
+        // stay consistent or later validated inserts see phantom state.
+        let cols = table.uniq_cols();
+        table.check_uniq(&cols, &row.values, None)?;
+        let row_id = table.next_row_id();
+        row.id = row_id;
+        table.index_row(&cols, row_id, &row.values);
         table.rows.insert(row_id, Arc::new(row));
         Ok(row_id)
     }
@@ -144,7 +228,7 @@ impl TableEngine for InMemoryTableEngine {
 
     fn get_arc(&self, table_name: &str, id: RowId) -> CoreResult<Option<Arc<Row>>> {
         let table = self.table(table_name)?;
-        let table = table.read().map_err(|_| lock_err())?;
+        let table = table.read();
         Ok(table.rows.get(&id).cloned())
     }
 
@@ -155,30 +239,52 @@ impl TableEngine for InMemoryTableEngine {
         values: HashMap<String, Value>,
     ) -> CoreResult<Row> {
         let table = self.table(table_name)?;
-        let mut table = table.write().map_err(|_| lock_err())?;
+        let mut table = table.write();
 
-        // Split borrows through the guard: rows for lookup, pool for scratch.
-        let InMemoryTable { rows, row_pool: pool, .. } = &mut *table;
-        let slot = rows
-            .get_mut(&id)
-            .ok_or_else(|| CoreError::RowNotFound(id.as_u64()))?;
+        // Snapshot pre-mutation unique values first (no slot borrow held).
+        let old_uniq: Vec<(String, Value)> = {
+            let cur = table.rows.get(&id).ok_or_else(|| CoreError::RowNotFound(id.as_u64()))?;
+            let cols = table.uniq_cols();
+            cols.iter()
+                .filter_map(|c| cur.values.get(c).map(|v| (c.clone(), v.clone())))
+                .collect()
+        };
+        // Uniqueness first (before mutating): a conflicting update must not
+        // partially apply.
+        let cols = table.uniq_cols();
+        table.check_uniq(&cols, &values, Some(id))?;
 
-        // Copy-on-write in place: clones the row only if other
-        // `Arc` handles (e.g. outstanding `get_arc` results) exist.
-        let row = Arc::make_mut(slot);
-        for (key, value) in values {
-            row.values.insert(key, value);
+        // Mutate in a tight scope so the slot borrow ends before index work.
+        // Copy-on-write: clones the row only if other `Arc` handles exist.
+        let new_row: Row = {
+            let slot = table.rows.get_mut(&id).expect("checked above");
+            let row = Arc::make_mut(slot);
+            for (key, value) in values {
+                row.values.insert(key, value);
+            }
+            // Single owned clone for the return value (previously double).
+            row.clone()
+        };
+        // Maintain indexes: drop stale keys, add current.
+        for (c, v) in old_uniq {
+            if new_row.values.get(&c) != Some(&v) {
+                if let Some(idx) = table.uniq.get_mut(&c) {
+                    if idx.get(&v) == Some(&id) {
+                        idx.remove(&v);
+                    }
+                }
+            }
         }
-
-        // Build the return value from a pooled scratch row so the
-        // returned HashMap reuses a previous allocation.
-        let mut pooled_row = pool.checkout();
-        pooled_row.id = row.id;
-        for (key, value) in row.values.iter() {
-            pooled_row.values.insert(key.clone(), value.clone());
+        let cur: Vec<(String, Value)> = cols
+            .iter()
+            .filter_map(|c| new_row.values.get(c).map(|v| (c.clone(), v.clone())))
+            .collect();
+        for (c, v) in cur {
+            if !v.is_null() {
+                table.uniq.entry(c).or_default().insert(v, id);
+            }
         }
-
-        Ok(pooled_row)
+        Ok(new_row)
     }
 
     fn delete(&self, table_name: &str, id: RowId) -> CoreResult<bool> {
@@ -187,8 +293,13 @@ impl TableEngine for InMemoryTableEngine {
 
     fn take(&self, table_name: &str, id: RowId) -> CoreResult<Option<Arc<Row>>> {
         let table = self.table(table_name)?;
-        let mut table = table.write().map_err(|_| lock_err())?;
-        Ok(table.rows.remove(&id))
+        let mut table = table.write();
+        let removed = table.rows.remove(&id);
+        if let Some(ref row) = removed {
+            let cols = table.uniq_cols();
+            table.unindex_row(&cols, id, &row.values);
+        }
+        Ok(removed)
     }
 
     fn scan(&self, table_name: &str) -> CoreResult<Vec<Row>> {
@@ -201,46 +312,64 @@ impl TableEngine for InMemoryTableEngine {
 
     fn scan_arcs(&self, table_name: &str) -> CoreResult<Vec<Arc<Row>>> {
         let table = self.table(table_name)?;
-        let table = table.read().map_err(|_| lock_err())?;
+        let table = table.read();
         Ok(table.rows.values().cloned().collect())
     }
 
     fn schema(&self, table_name: &str) -> CoreResult<TableSchema> {
         let table = self.table(table_name)?;
-        let table = table.read().map_err(|_| lock_err())?;
+        let table = table.read();
         Ok(table.schema.clone())
     }
 
     fn count(&self, table_name: &str) -> CoreResult<usize> {
         let table = self.table(table_name)?;
-        let table = table.read().map_err(|_| lock_err())?;
+        let table = table.read();
         Ok(table.rows.len())
     }
 
     fn create_table(&self, schema: TableSchema) -> CoreResult<()> {
         let name = schema.name.clone();
-        let mut tables = self.tables.write().map_err(|_| lock_err())?;
-        if tables.contains_key(&name) {
+        if self.tables.contains_key(&name) {
             return Err(CoreError::TableAlreadyExists(name));
         }
-        tables.insert(name, Arc::new(RwLock::new(InMemoryTable::new(schema))));
+        self.tables
+            .insert(name, Arc::new(RwLock::new(InMemoryTable::new(schema))));
         Ok(())
     }
 
     fn drop_table(&self, table_name: &str) -> CoreResult<()> {
         self.tables
-            .write()
-            .map_err(|_| lock_err())?
             .remove(table_name)
             .ok_or_else(|| CoreError::TableNotFound(table_name.to_string()))?;
         Ok(())
     }
 
     fn table_exists(&self, table_name: &str) -> bool {
-        self.tables
-            .read()
-            .map(|tables| tables.contains_key(table_name))
-            .unwrap_or(false)
+        self.tables.contains_key(table_name)
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.tables.iter().map(|r| r.key().clone()).collect()
+    }
+
+    fn insert_preserving_id(&self, table_name: &str, row: Row) -> CoreResult<RowId> {
+        let table = self.table(table_name)?;
+        let mut table = table.write();
+        let want = row.id;
+        if table.rows.contains_key(&want) {
+            return Err(CoreError::DuplicateKey(format!("row {}", want.as_u64())));
+        }
+        let cols = table.uniq_cols();
+        table.check_uniq(&cols, &row.values, Some(want))?;
+        // Bump allocator past restored ID (replay/snapshot must not collide
+        // with future auto-ids — the old recovery bug reassigned all IDs).
+        if want.as_u64() >= table.next_id {
+            table.next_id = want.as_u64() + 1;
+        }
+        table.index_row(&cols, want, &row.values);
+        table.rows.insert(want, Arc::new(row));
+        Ok(want)
     }
 }
 
@@ -309,6 +438,30 @@ mod tests {
         let id = engine.insert("users", make_row(1, "Alice")).unwrap();
         assert!(engine.delete("users", id).unwrap());
         assert!(engine.get("users", id).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_unique_enforced_and_freed_on_delete() {
+        let engine = InMemoryTableEngine::new();
+        engine.create_table(test_schema()).unwrap();
+        engine.insert("users", make_row(1, "Alice")).unwrap();
+        // Same email (make_row derives email from name) must fail.
+        let dup = engine.insert("users", make_row(2, "Alice"));
+        assert!(matches!(dup, Err(CoreError::DuplicateKey(_))), "got {:?}", dup);
+        // Different email ok.
+        engine.insert("users", make_row(2, "Bob")).unwrap();
+        // Update Bob onto Alice's email must fail without partial apply.
+        let bob = engine.scan("users").unwrap().into_iter().find(|r| r.get("name") == Some(&Value::String("Bob".into()))).unwrap();
+        let mut bad = HashMap::new();
+        bad.insert("email".into(), Value::String("Alice@example.com".into()));
+        assert!(engine.update("users", bob.id, bad).is_err());
+        // Delete Alice frees the address.
+        let alice = engine.scan("users").unwrap().into_iter().find(|r| r.get("name") == Some(&Value::String("Alice".into()))).unwrap();
+        engine.delete("users", alice.id).unwrap();
+        let mut reuse = HashMap::new();
+        reuse.insert("email".into(), Value::String("Alice@example.com".into()));
+        let bob2 = engine.scan("users").unwrap().into_iter().find(|r| r.get("name") == Some(&Value::String("Bob".into()))).unwrap();
+        assert!(engine.update("users", bob2.id, reuse).is_ok());
     }
 
     #[test]

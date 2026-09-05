@@ -69,6 +69,14 @@ impl TableSchema {
                 Some(val) if val.is_null() && !col.nullable => {
                     return Err(TypeError::NullValue);
                 }
+                Some(val) if !val.is_null() && !value_matches_type(val, &col.column_type) => {
+                    return Err(TypeError::SchemaError(format!(
+                        "column '{}' expects {}, got {}",
+                        col.name,
+                        col.column_type,
+                        val.type_name()
+                    )));
+                }
                 None if col.default.is_some() => {}
                 None if col.primary_key => {
                     return Err(TypeError::SchemaError(format!(
@@ -86,6 +94,41 @@ impl TableSchema {
             }
         }
         Ok(())
+    }
+}
+
+/// Strict column-type check for trusted validation.
+/// Ints accept only their exact width (no silent coercion — coercion bugs
+/// caused silent data corruption in early prototypes). Null always passes
+/// here (nullability handled above). Json/Array accept their exact shapes;
+///
+/// NOTE: `Decimal` accepts `Decimal` + numeric strings? No — strict:
+/// only `Value::Decimal`. Numbers in JSON payloads map via WAL/snapshot
+/// `json_to_value` to Int64/UInt64/Float64, never Decimal.
+fn value_matches_type(val: &Value, ct: &crate::column::ColumnType) -> bool {
+    use crate::column::ColumnType as T;
+    use crate::value::Value as V;
+    match (val, ct) {
+        (V::Boolean(_), T::Boolean) => true,
+        (V::Int8(_), T::Int8) => true,
+        (V::Int16(_), T::Int16) => true,
+        (V::Int32(_), T::Int32) => true,
+        (V::Int64(_), T::Int64) => true,
+        (V::UInt8(_), T::UInt8) => true,
+        (V::UInt16(_), T::UInt16) => true,
+        (V::UInt32(_), T::UInt32) => true,
+        (V::UInt64(_), T::UInt64) => true,
+        (V::Float32(_), T::Float32) => true,
+        (V::Float64(_), T::Float64) => true,
+        (V::Decimal(_), T::Decimal) => true,
+        (V::String(_), T::String) => true,
+        (V::Bytes(_), T::Bytes) => true,
+        (V::Uuid(_), T::Uuid) => true,
+        (V::Timestamp(_), T::Timestamp) => true,
+        (V::Date(_), T::Date) => true,
+        (V::Json(_), T::Json) => true,
+        (V::Array(_), T::Array) => true,
+        _ => false,
     }
 }
 

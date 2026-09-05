@@ -11,5 +11,7 @@ thiserror = { workspace = true }
 hashbrown = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
 
 [dev-dependencies]

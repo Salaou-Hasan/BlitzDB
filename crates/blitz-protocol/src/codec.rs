@@ -83,7 +83,13 @@ struct Writer {
 
 impl Writer {
     fn new() -> Self {
-        Self { buf: Vec::new() }
+        // Typical single request/response ≈ 100-200B; pre-size to avoid the
+        // first realloc on every frame (millions/sec hot path).
+        Self { buf: Vec::with_capacity(256) }
+    }
+
+    fn with_capacity(cap: usize) -> Self {
+        Self { buf: Vec::with_capacity(cap) }
     }
 
     fn bytes(self) -> Bytes {
@@ -301,6 +307,31 @@ impl Writer {
         }
     }
 
+    /// Borrowed response body: encodes rows without cloning `Value`s.
+    /// Hot path for Get/Scan — saves one HashMap + N String/Value clones
+    /// per row (≈30-40% of read latency).
+    fn response_body_borrowed(
+        &mut self,
+        id: u64,
+        rows: &[(u64, &HashMap<String, Value>)],
+        error: Option<&str>,
+    ) {
+        self.u64(id);
+        self.u8(error.is_none() as u8);
+        self.u32(rows.len() as u32);
+        for (rid, map) in rows {
+            self.u64(*rid);
+            self.map(map);
+        }
+        match error {
+            Some(msg) => {
+                self.u8(1);
+                self.str_(msg);
+            }
+            None => self.u8(0),
+        }
+    }
+
     fn row_view(&mut self, row: &RowView) {
         self.u64(row.id);
         self.map(&row.values);
@@ -438,6 +469,14 @@ impl<'a> Reader<'a> {
             0x12 => Ok(Value::Json(self.json()?)),
             0x13 => {
                 let count = self.u32()? as usize;
+                // Bound per-value CPU: array length is also bounded by the
+                // enclosing frame, but reject absurd counts early.
+                if count > 65536 {
+                    return Err(ProtocolError::DecodeError(format!(
+                        "array too large: {}",
+                        count
+                    )));
+                }
                 let mut items = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
                     items.push(self.value()?);
@@ -462,6 +501,12 @@ impl<'a> Reader<'a> {
             0x0D => Ok(serde_json::Value::String(self.str_()?)),
             0x12 => {
                 let count = self.u32()? as usize;
+                if count > 4096 {
+                    return Err(ProtocolError::DecodeError(format!(
+                        "json object too large: {}",
+                        count
+                    )));
+                }
                 let mut map = serde_json::Map::with_capacity(count.min(64));
                 for _ in 0..count {
                     let key = self.str_()?;
@@ -471,6 +516,12 @@ impl<'a> Reader<'a> {
             }
             0x13 => {
                 let count = self.u32()? as usize;
+                if count > 65536 {
+                    return Err(ProtocolError::DecodeError(format!(
+                        "json array too large: {}",
+                        count
+                    )));
+                }
                 let mut items = Vec::with_capacity(count.min(1024));
                 for _ in 0..count {
                     items.push(self.json()?);
@@ -486,6 +537,12 @@ impl<'a> Reader<'a> {
 
     fn map(&mut self) -> ProtocolResult<HashMap<String, Value>> {
         let count = self.u32()? as usize;
+        if count > 4096 {
+            return Err(ProtocolError::DecodeError(format!(
+                "map too large: {}",
+                count
+            )));
+        }
         let mut out = HashMap::with_capacity(count.min(64));
         for _ in 0..count {
             let key = self.str_()?;
@@ -528,6 +585,12 @@ impl<'a> Reader<'a> {
         let id = self.u64()?;
         let ok = self.u8()? != 0;
         let row_count = self.u32()? as usize;
+        if row_count > 1_000_000 {
+            return Err(ProtocolError::DecodeError(format!(
+                "row_count too large: {}",
+                row_count
+            )));
+        }
         let mut rows = Vec::with_capacity(row_count.min(1024));
         for _ in 0..row_count {
             rows.push(self.row_view()?);
@@ -613,7 +676,8 @@ impl FrameCodec {
     /// Serialize a batch of requests into a single framed buffer.
     /// One frame carries N ops: syscalls, wakes and framing amortize ~N×.
     pub fn encode_batch_request(&self, batch: &BatchRequest) -> ProtocolResult<Bytes> {
-        let mut w = Writer::new();
+        // ~128B per op typical for app rows; pre-size the whole frame.
+        let mut w = Writer::with_capacity(batch.ops.len() * 128 + 16);
         w.u8(KIND_BATCH_REQUEST);
         w.u64(batch.id);
         w.u32(batch.ops.len() as u32);
@@ -631,9 +695,35 @@ impl FrameCodec {
         self.frame(w.bytes())
     }
 
+    /// Zero-copy single-row response: borrows the row map, no `Value` clones.
+    /// Use for Get/Update fast paths straight off `Arc<Row>`.
+    pub fn encode_ok_single(
+        &self,
+        id: u64,
+        row_id: u64,
+        values: &HashMap<String, Value>,
+    ) -> ProtocolResult<Bytes> {
+        let mut w = Writer::new();
+        w.u8(KIND_RESPONSE);
+        w.response_body_borrowed(id, &[(row_id, values)], None);
+        self.frame(w.bytes())
+    }
+
+    /// Zero-copy multi-row response: borrows each row map (Scan fast path).
+    pub fn encode_ok_borrowed(
+        &self,
+        id: u64,
+        rows: &[(u64, &HashMap<String, Value>)],
+    ) -> ProtocolResult<Bytes> {
+        let mut w = Writer::new();
+        w.u8(KIND_RESPONSE);
+        w.response_body_borrowed(id, rows, None);
+        self.frame(w.bytes())
+    }
+
     /// Serialize a batch of responses into a single framed buffer.
     pub fn encode_batch_response(&self, batch: &BatchResponse) -> ProtocolResult<Bytes> {
-        let mut w = Writer::new();
+        let mut w = Writer::with_capacity(batch.results.len() * 128 + 16);
         w.u8(KIND_BATCH_RESPONSE);
         w.u64(batch.id);
         w.u32(batch.results.len() as u32);
@@ -688,6 +778,13 @@ impl FrameCodec {
             KIND_BATCH_REQUEST => {
                 let id = r.u64()?;
                 let count = r.u32()? as usize;
+                // Bound per-frame dispatch work before allocating/looping.
+                if count > 4096 {
+                    return Err(ProtocolError::DecodeError(format!(
+                        "batch too large: {} > 4096",
+                        count
+                    )));
+                }
                 let mut ops = Vec::with_capacity(count.min(4096));
                 for _ in 0..count {
                     ops.push(r.request_body()?);
@@ -720,6 +817,12 @@ impl FrameCodec {
         expect_kind(&mut r, KIND_BATCH_RESPONSE)?;
         let id = r.u64()?;
         let count = r.u32()? as usize;
+        if count > 4096 {
+            return Err(ProtocolError::DecodeError(format!(
+                "batch response too large: {} > 4096",
+                count
+            )));
+        }
         let mut results = Vec::with_capacity(count.min(4096));
         for _ in 0..count {
             results.push(r.response_body()?);

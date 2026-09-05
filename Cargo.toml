@@ -69,6 +69,9 @@ pin-project-lite = "0.2"
 # Collections
 hashbrown = "0.15"
 bytes = "1"
+parking_lot = "0.12"
+socket2 = "0.6"
+dashmap = "5"
 
 # Macros
 paste = "1"
