@@ -26,6 +26,10 @@ AtomicBatch (0x03) runs one OCC tx, all-or-nothing):
   RepeatableRead commit → per-write responses + post-commit WAL/log/derived
   Call (tag 9): fn-auth + per-step invoker table rights → run procedure steps
   against tx backend (fuel-capped) → single commit → result row + _applied
+Routing (`table_shards`, empty = unsharded): insert hashes shard-key % N
+  (FNV-1a) → `{base}_{NN}` physicals; point ops route by RowId high bits;
+  Scan/Find fan out + merge with global ids; change-log stays on base names;
+  WAL carries global ids (replay strips to local per physical).
   ▼
 Engine: DashMap table map → per-table RwLock → HashMap rows + per-col unique maps
   ▼

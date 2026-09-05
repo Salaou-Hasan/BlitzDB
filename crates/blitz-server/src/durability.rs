@@ -582,7 +582,11 @@ pub fn recover(engine: &InMemoryTableEngine, data_dir: &str) -> anyhow::Result<(
                     let schema = infer_schema(&e.table, &values);
                     let _ = engine.create_table(schema);
                 }
-                let row = Row { id: RowId::new(e.row_id), values };
+                // WAL carries GLOBAL ids (shard<<56|local); the engine stores
+                // LOCAL ids per physical table. Unsharded rows have zero high
+                // bits, so stripping is backward compatible.
+                let local = e.row_id & crate::server::LOCAL_MASK;
+                let row = Row { id: RowId::new(local), values };
                 if engine.insert_preserving_id(&e.table, row).is_ok() {
                     replayed += 1;
                 }
@@ -594,11 +598,13 @@ pub fn recover(engine: &InMemoryTableEngine, data_dir: &str) -> anyhow::Result<(
                         .and_then(|v| v.as_object().cloned())
                         .map(|m| m.into_iter().map(|(k, j)| (k, json_to_value(&j))).collect())
                         .unwrap_or_default();
-                let _ = engine.update(&e.table, RowId::new(e.row_id), values);
+                let local = e.row_id & crate::server::LOCAL_MASK;
+                let _ = engine.update(&e.table, RowId::new(local), values);
                 replayed += 1;
             }
             blitz_wal::EntryType::Delete => {
-                let _ = engine.delete(&e.table, RowId::new(e.row_id));
+                let local = e.row_id & crate::server::LOCAL_MASK;
+                let _ = engine.delete(&e.table, RowId::new(local));
                 replayed += 1;
             }
             _ => {}

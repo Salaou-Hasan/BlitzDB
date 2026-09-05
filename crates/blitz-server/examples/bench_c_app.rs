@@ -494,6 +494,22 @@ async fn run_level(ccu: usize, ops: usize, batch: usize, shards: usize) {
     // (default none = in-memory speed).
     let mut cfg = blitz_server::ServerConfig::default();
     cfg.skip_validation = true;
+    // BLITZ_SERVER_SHARDS=1: server-side routing. Clients speak BASE names
+    // (naming shards=1); the server hashes into `shards` physical tables with
+    // the identical `{base}_{NN}` layout. Same data distribution, stable model.
+    let server_side = std::env::var("BLITZ_SERVER_SHARDS").as_deref() == Ok("1") && shards > 1;
+    if server_side {
+        for (base, col) in [
+            ("posts", "author"),
+            ("likes", "user"),
+            ("follows", "from"),
+            ("comments", "post"),
+            ("notifs", "user"),
+            ("messages", "from"),
+        ] {
+            cfg.table_shards.insert(base.into(), blitz_server::ShardSpec::new(shards, col));
+        }
+    }
     if let Ok(dir) = std::env::var("BLITZ_DATA_DIR") {
         // Per-level subdir: isolates levels (no cross-level replay
         // accumulation — each level models a steady-state server with rotation
@@ -510,12 +526,14 @@ async fn run_level(ccu: usize, ops: usize, batch: usize, shards: usize) {
     let durable = cfg.durability.is_durable();
     let server = Arc::new(BlitzServer::with_config(cfg));
     server.start().await.unwrap();
-    if shards <= 1 {
+    // Physical tables exist under both layouts (client-mangled or routed).
+    let physical_shards = if shards <= 1 { 1 } else { shards };
+    if physical_shards <= 1 {
         for t in app_tables() {
             let _ = server.engine().create_table(t);
         }
     } else {
-        for s in 0..shards {
+        for s in 0..physical_shards {
             for t in app_tables() {
                 let mut st = t.clone();
                 st.name = format!("{}_{:02}", t.name, s);
@@ -525,7 +543,7 @@ async fn run_level(ccu: usize, ops: usize, batch: usize, shards: usize) {
     }
     {
         use blitz_types::{id::RowId, row::Row};
-        if shards <= 1 {
+        if physical_shards <= 1 {
             for i in 0..1000i64 {
                 let mut r = Row::new(RowId::new(0));
                 r.set("user", Value::String("seed".into()));
@@ -533,8 +551,8 @@ async fn run_level(ccu: usize, ops: usize, batch: usize, shards: usize) {
                 let _ = server.engine().insert("notifs", r);
             }
         } else {
-            let per = (1000 / shards as i64).max(16);
-            for s in 0..shards {
+            let per = (1000 / physical_shards as i64).max(16);
+            for s in 0..physical_shards {
                 for i in 0..per {
                     let mut r = Row::new(RowId::new(0));
                     r.set("user", Value::String("seed".into()));
@@ -565,14 +583,17 @@ async fn run_level(ccu: usize, ops: usize, batch: usize, shards: usize) {
     };
     let barrier = Arc::new(tokio::sync::Barrier::new(ccu + 1));
     let mut hs = Vec::with_capacity(ccu);
+    // Server-side routing: clients name base tables (shards=1 for tname);
+    // the server distributes. Otherwise clients pin `idx % shards`.
+    let naming = if server_side { 1 } else { shards };
     for c in 0..ccu {
         if ccu > 5000 && c % 1000 == 999 {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         if batch <= 1 {
-            hs.push(tokio::spawn(run_client(addr, c as i64, ops, Arc::clone(&barrier), shards)));
+            hs.push(tokio::spawn(run_client(addr, c as i64, ops, Arc::clone(&barrier), naming)));
         } else {
-            hs.push(tokio::spawn(run_client_batched(addr, c as i64, ops, Arc::clone(&barrier), batch, shards)));
+            hs.push(tokio::spawn(run_client_batched(addr, c as i64, ops, Arc::clone(&barrier), batch, naming)));
         }
     }
     let cpu0 = blitz_server::bench_common::cpu_ms();

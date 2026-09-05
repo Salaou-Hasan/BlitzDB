@@ -41,6 +41,23 @@ frame = one read + one write. Per-op ok/err independent (partial failure
 normal, never atomic). Per-op latency ≈ `batch_time / N` (throughput exact).
 Recommended N = 25.
 
+## Sharding (server-side, stable names)
+
+App code always uses BASE table names (`posts`, never `posts_03`). When the
+server configures `table_shards: {base: (N, column)}`, inserts hash
+`values[column] % N` (FNV-1a, deterministic) into `{base}_{NN}` physicals;
+point reads/writes route by RowId shard bits; Scan/Find fan out server-side.
+RowIds are global (`shard<<56 | local`): echo them back verbatim — Gets,
+Updates, Deletes, and cursors all work on globals. `Subscribe`/change-log
+stay on base names; search postings resolve internally.
+
+- Configure before data lands (no online resharding in v1); legacy
+  high-bits-0 ids route to shard 0.
+- Unique indexes are per-shard (global uniqueness needs the shard key to be
+  the unique column, or an unsharded table).
+- Rows without the shard-key column hash deterministically to one shard
+  (they don't scatter — by design, not accident).
+
 ## Atomic batches (all-or-nothing)
 
 Same `BatchRequest` layout under kind byte `0x03` (`encode_atomic_batch_request`).

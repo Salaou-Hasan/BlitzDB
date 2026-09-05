@@ -17,7 +17,7 @@ with op/conn/error/tx-state/queue-state/timestamps.
 |---|---|---|
 | `bench_a_connections` | `... bench_a_connections 100000` | Idle CCU: setup rate, KB/conn, heartbeat p50/p99 |
 | `bench_b_active` | `... bench_b_active 16000 1` | Active ping-pong ceiling (stops at first loss) |
-| `bench_c_app` | `... bench_c_app 50000 20 25 16` | App mix SLOs 10K→50K (`max ops batch shards`); `BLITZ_DATA_DIR`+`BLITZ_DURABILITY` for durable runs; `BLITZ_ATOMIC=1` for all-or-nothing frames |
+| `bench_c_app` | `... bench_c_app 50000 20 25 16` | App mix SLOs 10K→50K (`max ops batch shards`); `BLITZ_DATA_DIR`+`BLITZ_DURABILITY` for durable runs; `BLITZ_ATOMIC=1` for all-or-nothing frames; `BLITZ_SERVER_SHARDS=1` for server-side routing (clients speak base names) |
 | `bench_c_tiny` | `... bench_c_tiny 10000` | Sequential 1/10/20/100 per-conn + GET-/INSERT-/UPDATE-only isolation |
 | `bench_hotspot` | `... bench_hotspot 10000 50` | 1%-keys/50%-traffic skew (celebrity rule) |
 | `ccu_bench` | `... ccu_bench 20000 16000 1` | Legacy engine/codec/TCP-ramp/pipe/batch survey |
@@ -45,6 +45,11 @@ Atomic batches (`BLITZ_ATOMIC=1`, same 10K app mix): 1.52M/s, p50 3.3ms,
 p99 5.3ms, 0 errors, PASS. Cost of all-or-nothing at 10K: ~0.75× goodput,
 +1.4ms p99 vs plain batch (2.03M/s, p99 3.9ms same run) — same latency class,
 0 tx_conflicts (blind inserts + stable-row reads don't contend).
+
+Server-side routing (`BLITZ_SERVER_SHARDS=1`, 10K, 16 shards, base names on
+the wire): 1.96M/s, p50 2.3ms, p99 4.2ms, 0 errors, PASS — indistinguishable
+from client-mangled sharding (2.03M/s, p99 3.9ms). The model no longer
+changes with scale.
 
 ## Reading results honestly
 

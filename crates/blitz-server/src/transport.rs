@@ -275,50 +275,56 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                 blitz_types::value::Value::String(s) => Some(s),
                 _ => None,
             });
-            if let Some(ref key) = idem {
+            if let Some(key) = idem.as_deref() {
                 if let Some(cached) = server.idem_lookup(key) {
                     return Response::ok(id, vec![RowView { id: cached, values }]);
                 }
             }
+            // Server-side routing: base name in, (physical, shard) out.
+            // Unsharded tables pass through identically (shard 0, local id).
+            let (physical, shard) = server.route_insert(&req.table, &values);
             let mut row = Row::new(RowId::new(0));
             for (k, v) in &values {
                 row.set(k.clone(), v.clone());
             }
             // Shard/cache fast path: trusted shape skips validation.
             let res = if server.config().skip_validation {
-                server.engine().insert_unchecked(&req.table, row)
+                server.engine().insert_unchecked(&physical, row)
             } else {
-                server.engine().insert(&req.table, row)
+                server.engine().insert(&physical, row)
             };
             match res {
-                Ok(assigned) => {
+                Ok(local) => {
+                    let global = BlitzServer::compose_id(shard, local.as_u64());
                     // Durability: never ack unwritten data in durable modes.
                     // On backpressure, compensate (delete just-inserted row)
                     // so engine/WAL can't diverge, then shed fast.
                     let data = crate::durability::values_to_json_bytes(&values);
-                    if let Err(w) = server.wal_log(blitz_wal::EntryType::Insert, &req.table, assigned.as_u64(), data) {
-                        let _ = server.engine().delete(&req.table, assigned);
+                    if let Err(w) = server.wal_log(blitz_wal::EntryType::Insert, &physical, global, data) {
+                        let _ = server.engine().delete(&physical, local);
                         return Response::err(id, format!("WAL backpressure: {}", w));
                     }
                     if let Some(key) = idem {
-                        server.idem_record(key, assigned.as_u64());
+                        server.idem_record(key, global);
                     }
-                    server.record_change(&req.table, "insert", assigned.as_u64());
+                    // Change-log/push key on the BASE name (stable Subscribe);
+                    // search postings key on the physical table (resolution).
+                    server.record_change(&req.table, "insert", global);
                     // Social derived state (post ack only): search index +
                     // async fanout job. Both fire-and-forget bounded; neither
                     // blocks the response (eventual, ~ms).
                     if req.table.starts_with("posts") {
                         if let Some(blitz_types::value::Value::String(body)) = values.get("body") {
-                            server.index_post(&req.table, assigned.as_u64(), body);
+                            server.index_post(&physical, local.as_u64(), body);
                         }
                         if let Some(blitz_types::value::Value::String(author)) = values.get("author") {
-                            server.fanout_enqueue(req.table.clone(), assigned.as_u64(), author.clone());
+                            server.fanout_enqueue(physical.clone(), local.as_u64(), author.clone());
                         }
                     }
                     Response::ok(
                         id,
                         vec![RowView {
-                            id: assigned.as_u64(),
+                            id: global,
                             values,
                         }],
                     )
@@ -327,39 +333,42 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
             }
         }
         Op::Get => {
-            let row_id = match req.row_id {
-                Some(rid) => RowId::new(rid),
+            let global = match req.row_id {
+                Some(rid) => rid,
                 None => return Response::err(id, "get requires row_id"),
             };
+            let (physical, local) = server.route_id(&req.table, global);
             // Zero-copy read: serialize straight off the shared handle.
-            match server.engine().get_arc(&req.table, row_id) {
-                Ok(Some(row)) => Response::ok(id, vec![row_to_view(row_id, &row)]),
-                Ok(None) => Response::err(id, format!("row not found: {}", row_id)),
+            match server.engine().get_arc(&physical, RowId::new(local)) {
+                Ok(Some(row)) => Response::ok(id, vec![row_to_view(RowId::new(global), &row)]),
+                Ok(None) => Response::err(id, format!("row not found: {}", RowId::new(global))),
                 Err(e) => Response::err(id, e.to_string()),
             }
         }
         Op::Update => {
-            let row_id = match req.row_id {
-                Some(rid) => RowId::new(rid),
+            let global = match req.row_id {
+                Some(rid) => rid,
                 None => return Response::err(id, "update requires row_id"),
             };
+            let (physical, local) = server.route_id(&req.table, global);
             let values = match req.values {
                 Some(v) => v,
                 None => return Response::err(id, "update requires values"),
             };
             // Move, don't clone: engine already returns an owned Row, so
             // moving its map into the view saves a second HashMap clone.
-            match server.engine().update(&req.table, row_id, values) {
+            // Response id is the GLOBAL id (engine rows carry local ids).
+            match server.engine().update(&physical, RowId::new(local), values) {
                 Ok(row) => {
                     let data = crate::durability::values_to_json_bytes(&row.values);
-                    if let Err(w) = server.wal_log(blitz_wal::EntryType::Update, &req.table, row_id.as_u64(), data) {
+                    if let Err(w) = server.wal_log(blitz_wal::EntryType::Update, &physical, global, data) {
                         return Response::err(id, format!("WAL backpressure: {}", w));
                     }
-                    server.record_change(&req.table, "update", row_id.as_u64());
+                    server.record_change(&req.table, "update", global);
                     Response::ok(
                         id,
                         vec![RowView {
-                            id: row.id.as_u64(),
+                            id: global,
                             values: row.values,
                         }],
                     )
@@ -368,45 +377,48 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
             }
         }
         Op::Delete => {
-            let row_id = match req.row_id {
-                Some(rid) => RowId::new(rid),
+            let global = match req.row_id {
+                Some(rid) => rid,
                 None => return Response::err(id, "delete requires row_id"),
             };
-            match server.engine().delete(&req.table, row_id) {
+            let (physical, local) = server.route_id(&req.table, global);
+            match server.engine().delete(&physical, RowId::new(local)) {
                 Ok(true) => {
-                    if let Err(w) = server.wal_log(blitz_wal::EntryType::Delete, &req.table, row_id.as_u64(), Vec::new()) {
+                    if let Err(w) = server.wal_log(blitz_wal::EntryType::Delete, &physical, global, Vec::new()) {
                         return Response::err(id, format!("WAL backpressure: {}", w));
                     }
-                    server.record_change(&req.table, "delete", row_id.as_u64());
+                    server.record_change(&req.table, "delete", global);
                     Response::ok(id, Vec::new())
                 }
-                Ok(false) => Response::err(id, format!("row not found: {}", row_id)),
+                Ok(false) => Response::err(id, format!("row not found: {}", RowId::new(global))),
                 Err(e) => Response::err(id, e.to_string()),
             }
         }
         Op::Scan => {
             let w = scan_pagination(&req.values);
-            match server.engine().scan_arcs(&req.table) {
-                // Paginated + cursor scan over RowId order. The limit bounds
-                // CPU/frame; cursor (binary search) keeps pages stable under
-                // concurrent inserts. NOTE: per-request full sort — hot
-                // timeline paths must use precomputed feeds (Stage 9+), not
-                // scans; this primitive is for admin/backfill pages.
-                Ok(mut rows) => {
-                    if w.desc {
-                        rows.sort_by_key(|r| std::cmp::Reverse(r.id));
-                    } else {
-                        rows.sort_by_key(|r| r.id);
-                    }
-                    let (start, end) = apply_window(rows.len(), !w.desc, &w, &|i| rows[i].id.as_u64());
-                    let views = rows[start..end]
-                        .iter()
-                        .map(|row| row_to_view(row.id, row))
-                        .collect();
-                    Response::ok(id, views)
-                }
-                Err(e) => Response::err(id, e.to_string()),
+            // Fan out across shards server-side: merge (global id, row),
+            // sort, then window. Base names stay stable for callers.
+            // (Same helper as the Single fast path: one ordering contract.)
+            let mut merged = match scan_merged(server, &req.table) {
+                Ok(m) => m,
+                Err(e) => return Response::err(id, e),
+            };
+            // Paginated + cursor scan over global RowId order. The limit
+            // bounds CPU/frame; cursor (binary search) keeps pages stable
+            // under concurrent inserts. NOTE: per-request full sort — hot
+            // timeline paths must use precomputed feeds (Stage 9+), not
+            // scans; this primitive is for admin/backfill pages.
+            if w.desc {
+                merged.sort_by_key(|r| std::cmp::Reverse(r.0));
+            } else {
+                merged.sort_by_key(|r| r.0);
             }
+            let (start, end) = apply_window(merged.len(), !w.desc, &w, &|i| merged[i].0);
+            let views = merged[start..end]
+                .iter()
+                .map(|(gid, row)| row_to_view(RowId::new(*gid), row))
+                .collect();
+            Response::ok(id, views)
         }
         Op::Find => {
             let (col, val) = match req.values.as_ref().and_then(|m| {
@@ -418,13 +430,37 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                 Some(cv) => cv,
                 None => return Response::err(id, "find requires values {_col: String, _val: Value}"),
             };
-            match server.engine().lookup_by_unique(&req.table, &col, &val) {
-                Ok(Some(row)) => {
-                    let rid = row.id;
-                    Response::ok(id, vec![row_to_view(rid, &row)])
+            // Unique indexes are per-shard: probe each physical table.
+            let mut hit: Option<(usize, std::sync::Arc<Row>)> = None;
+            let mut find_err: Option<String> = None;
+            for (shard, physical) in server.shard_tables(&req.table) {
+                match server.engine().lookup_by_unique(&physical, &col, &val) {
+                    Ok(Some(row)) => {
+                        hit = Some((shard, row));
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Fresh shard tables don't exist yet: probe on.
+                        // Anything else (incl. non-unique column) is a
+                        // real error.
+                        if e.to_string().contains("table not found") {
+                            continue;
+                        }
+                        find_err = Some(e.to_string());
+                        break;
+                    }
                 }
-                Ok(None) => Response::err(id, "not found"),
-                Err(e) => Response::err(id, e.to_string()),
+            }
+            if let Some(e) = find_err {
+                return Response::err(id, e);
+            }
+            match hit {
+                Some((shard, row)) => {
+                    let global = BlitzServer::compose_id(shard, row.id.as_u64());
+                    Response::ok(id, vec![row_to_view(RowId::new(global), &row)])
+                }
+                None => Response::err(id, "not found"),
             }
         }
         Op::Subscribe => {
@@ -489,10 +525,16 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                 None => return Response::err(id, "search requires values {_q: String}"),
             };
             // Resolve postings to rows (bounded fan-out: ≤100 engine reads).
+            // Postings carry (physical table, local id); responses carry
+            // GLOBAL ids so clients can Get them back.
             let mut rows = Vec::new();
             for (table, rid) in server.search_posts(&q, limit) {
                 match server.engine().get_arc(&table, RowId::new(rid)) {
-                    Ok(Some(row)) => rows.push(row_to_view(RowId::new(rid), &row)),
+                    Ok(Some(row)) => {
+                        let shard = server.shard_of_physical(&req.table, &table);
+                        let global = BlitzServer::compose_id(shard, rid);
+                        rows.push(row_to_view(RowId::new(global), &row))
+                    }
                     _ => {}
                 }
             }
@@ -564,12 +606,32 @@ fn execute_atomic(
 
     // Phase 1: buffer. Gets read (recording versions); writes buffer.
     // Existence pre-checks double as read-set population for RR validation.
+    // All engine ops use PHYSICAL tables + LOCAL ids; responses translate
+    // back to global ids at commit.
     enum Buffered {
         Ping,
         Get { view: RowView },
-        Insert { values: std::collections::HashMap<String, Value>, idem: Option<String> },
-        Update { table: String, id: RowId },
-        Delete { table: String, id: RowId },
+        Insert {
+            base: String,
+            physical: String,
+            shard: usize,
+            values: std::collections::HashMap<String, Value>,
+            idem: Option<String>,
+        },
+        Update {
+            base: String,
+            physical: String,
+            shard: usize,
+            local: RowId,
+            global: u64,
+        },
+        Delete {
+            base: String,
+            physical: String,
+            shard: usize,
+            local: RowId,
+            global: u64,
+        },
     }
     let mut tx = server.tx_manager().begin(IsolationLevel::RepeatableRead);
     let mut buffered: Vec<(u64, Buffered)> = Vec::with_capacity(ops.len());
@@ -589,13 +651,15 @@ fn execute_atomic(
         match op.op {
             Op::Ping => buffered.push((rid, Buffered::Ping)),
             Op::Get => {
-                let row_id = match op.row_id {
-                    Some(r) => RowId::new(r),
+                let global = match op.row_id {
+                    Some(r) => r,
                     None => return fail(&mut tx, rid, "get requires row_id".to_string()),
                 };
-                match server.tx_manager().get(&mut tx, &op.table, row_id) {
-                    Ok(Some(row)) => buffered.push((rid, Buffered::Get { view: row_to_view(row_id, &row) })),
-                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", row_id)),
+                let (physical, local) = server.route_id(&op.table, global);
+                let local_id = RowId::new(local);
+                match server.tx_manager().get(&mut tx, &physical, local_id) {
+                    Ok(Some(row)) => buffered.push((rid, Buffered::Get { view: row_to_view(RowId::new(global), &row) })),
+                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", local_id)),
                     Err(e) => return fail(&mut tx, rid, e.to_string()),
                 }
             }
@@ -627,22 +691,24 @@ fn execute_atomic(
                 }
                 // Intra-batch duplicate pre-check against live unique indexes.
                 // Engine owns the index truth; ask it per unique column.
-                if let Ok(schema) = server.engine().schema(&op.table) {
+                // Unique scope is the PHYSICAL table (per-shard uniqueness).
+                let (physical, shard) = server.route_insert(&op.table, &values);
+                if let Ok(schema) = server.engine().schema(&physical) {
                     for col in schema.columns.iter().filter(|c| c.unique) {
                         if let Some(v) = values.get(&col.name) {
-                            let key = (op.table.clone(), col.name.clone(), format!("{:?}", v));
+                            let key = (physical.clone(), col.name.clone(), format!("{:?}", v));
                             if !seen_uniques.insert(key) {
                                 return fail(
                                     &mut tx,
                                     rid,
-                                    format!("duplicate value in batch for unique {}.{}", op.table, col.name),
+                                    format!("duplicate value in batch for unique {}.{}", physical, col.name),
                                 );
                             }
-                            if server.engine().lookup_by_unique(&op.table, &col.name, v).ok().flatten().is_some() {
+                            if server.engine().lookup_by_unique(&physical, &col.name, v).ok().flatten().is_some() {
                                 return fail(
                                     &mut tx,
                                     rid,
-                                    format!("duplicate value for unique {}.{}", op.table, col.name),
+                                    format!("duplicate value for unique {}.{}", physical, col.name),
                                 );
                             }
                         }
@@ -652,46 +718,52 @@ fn execute_atomic(
                 for (k, v) in &values {
                     row.set(k.clone(), v.clone());
                 }
-                if let Err(e) = tx.insert(op.table.clone(), row) {
+                if let Err(e) = tx.insert(physical.clone(), row) {
                     return fail(&mut tx, rid, e.to_string());
                 }
-                buffered.push((rid, Buffered::Insert { values, idem }));
+                buffered.push((rid, Buffered::Insert { base: op.table, physical, shard, values, idem }));
             }
             Op::Update => {
-                let row_id = match op.row_id {
-                    Some(r) => RowId::new(r),
+                let global = match op.row_id {
+                    Some(r) => r,
                     None => return fail(&mut tx, rid, "update requires row_id".to_string()),
                 };
+                let (physical, local) = server.route_id(&op.table, global);
+                let local_id = RowId::new(local);
                 let values = match op.values {
                     Some(v) => v,
                     None => return fail(&mut tx, rid, "update requires values".to_string()),
                 };
                 // Read-before-write: existence check + read-set entry, so a
                 // concurrent writer aborts us at commit instead of clobbering.
-                match server.tx_manager().get(&mut tx, &op.table, row_id) {
+                match server.tx_manager().get(&mut tx, &physical, local_id) {
                     Ok(Some(_)) => {}
-                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", row_id)),
+                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", local_id)),
                     Err(e) => return fail(&mut tx, rid, e.to_string()),
                 }
-                if let Err(e) = tx.update(op.table.clone(), row_id, values) {
+                if let Err(e) = tx.update(physical.clone(), local_id, values) {
                     return fail(&mut tx, rid, e.to_string());
                 }
-                buffered.push((rid, Buffered::Update { table: op.table, id: row_id }));
+                let (shard, _) = BlitzServer::split_id(global);
+                buffered.push((rid, Buffered::Update { base: op.table, physical, shard, local: local_id, global }));
             }
             Op::Delete => {
-                let row_id = match op.row_id {
-                    Some(r) => RowId::new(r),
+                let global = match op.row_id {
+                    Some(r) => r,
                     None => return fail(&mut tx, rid, "delete requires row_id".to_string()),
                 };
-                match server.tx_manager().get(&mut tx, &op.table, row_id) {
+                let (physical, local) = server.route_id(&op.table, global);
+                let local_id = RowId::new(local);
+                match server.tx_manager().get(&mut tx, &physical, local_id) {
                     Ok(Some(_)) => {}
-                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", row_id)),
+                    Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", local_id)),
                     Err(e) => return fail(&mut tx, rid, e.to_string()),
                 }
-                if let Err(e) = tx.delete(op.table.clone(), row_id) {
+                if let Err(e) = tx.delete(physical.clone(), local_id) {
                     return fail(&mut tx, rid, e.to_string());
                 }
-                buffered.push((rid, Buffered::Delete { table: op.table, id: row_id }));
+                let (shard, _) = BlitzServer::split_id(global);
+                buffered.push((rid, Buffered::Delete { base: op.table, physical, shard, local: local_id, global }));
             }
             Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call => {
                 return fail(&mut tx, rid, format!("{:?} not supported in atomic batch", op.op))
@@ -717,32 +789,36 @@ fn execute_atomic(
     // Phase 3: responses + post-commit side effects (WAL, change-log, social
     // derived state) mirroring dispatch, per applied write in buffer order.
     // WAL failures here bump wal_dropped (memory-committed, documented).
+    // touched pairs carry (physical, LOCAL); responses translate to global.
     let mut results = Vec::with_capacity(buffered.len());
     for (rid, b) in buffered {
         match b {
             Buffered::Ping => results.push(Response::ok(rid, Vec::new())),
             Buffered::Get { view } => results.push(Response::ok(rid, vec![view])),
-            Buffered::Insert { values, idem } => {
-                let (table, assigned) = match touch_iter.next() {
+            Buffered::Insert { base, physical, shard, values, idem } => {
+                let (_, local) = match touch_iter.next() {
                     Some(t) => t,
                     None => {
                         results.push(Response::err(rid, "atomic batch aborted: commit/response mismatch"));
                         continue;
                     }
                 };
+                let global = BlitzServer::compose_id(shard, local.as_u64());
                 emit_write_effects(
                     server,
-                    &table,
+                    &base,
+                    &physical,
                     blitz_wal::EntryType::Insert,
-                    assigned.as_u64(),
+                    local.as_u64(),
+                    global,
                     Some(&values),
                 );
                 if let Some(key) = idem {
-                    server.idem_record(key, assigned.as_u64());
+                    server.idem_record(key, global);
                 }
-                results.push(Response::ok(rid, vec![RowView { id: assigned.as_u64(), values }]));
+                results.push(Response::ok(rid, vec![RowView { id: global, values }]));
             }
-            Buffered::Update { table, id } => {
+            Buffered::Update { base, physical, local, global, .. } => {
                 match touch_iter.next() {
                     Some(_) => {}
                     None => {
@@ -750,21 +826,23 @@ fn execute_atomic(
                         continue;
                     }
                 }
-                match server.engine().get_arc(&table, id) {
+                match server.engine().get_arc(&physical, local) {
                     Ok(Some(row)) => {
                         emit_write_effects(
                             server,
-                            &table,
+                            &base,
+                            &physical,
                             blitz_wal::EntryType::Update,
-                            id.as_u64(),
+                            local.as_u64(),
+                            global,
                             Some(&row.values),
                         );
-                        results.push(Response::ok(rid, vec![row_to_view(id, &row)]));
+                        results.push(Response::ok(rid, vec![row_to_view(RowId::new(global), &row)]));
                     }
-                    _ => results.push(Response::err(rid, format!("row not found after commit: {}", id))),
+                    _ => results.push(Response::err(rid, format!("row not found after commit: {}", local))),
                 }
             }
-            Buffered::Delete { table, id } => {
+            Buffered::Delete { base, physical, local, global, .. } => {
                 match touch_iter.next() {
                     Some(_) => {}
                     None => {
@@ -772,7 +850,7 @@ fn execute_atomic(
                         continue;
                     }
                 }
-                emit_write_effects(server, &table, blitz_wal::EntryType::Delete, id.as_u64(), None);
+                emit_write_effects(server, &base, &physical, blitz_wal::EntryType::Delete, local.as_u64(), global, None);
                 results.push(Response::ok(rid, Vec::new()));
             }
         }
@@ -795,7 +873,9 @@ struct ProcBackend<'s> {
 }
 
 struct ProcWrite {
-    table: String,
+    base: String,
+    physical: String,
+    shard: usize,
     entry: blitz_wal::EntryType,
     values: Option<std::collections::HashMap<String, Value>>,
 }
@@ -845,10 +925,12 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
     ) -> blitz_runtime::RuntimeResult<Option<std::collections::HashMap<String, Value>>> {
         use blitz_runtime::RuntimeError;
         self.deny(Op::Get, table).map_err(RuntimeError::ExecutionError)?;
+        // Point reads route by global-id shard bits (base names in steps).
+        let (physical, local) = self.server.route_id(table, id);
         let row = self
             .server
             .tx_manager()
-            .get(&mut self.tx, table, RowId::new(id))
+            .get(&mut self.tx, &physical, RowId::new(local))
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
         Ok(row.map(|r| r.values))
     }
@@ -867,16 +949,19 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
                 }
             }
         }
-        self.check_unique(table, &values).map_err(RuntimeError::ExecutionError)?;
+        let (physical, shard) = self.server.route_insert(table, &values);
+        self.check_unique(&physical, &values).map_err(RuntimeError::ExecutionError)?;
         let mut row = Row::new(RowId::new(0));
         for (k, v) in &values {
             row.set(k.clone(), v.clone());
         }
         self.tx
-            .insert(table.to_string(), row)
+            .insert(physical.clone(), row)
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
         self.writes.push(ProcWrite {
-            table: table.to_string(),
+            base: table.to_string(),
+            physical,
+            shard,
             entry: blitz_wal::EntryType::Insert,
             values: Some(values),
         });
@@ -893,19 +978,24 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
         self.deny(Op::Update, table).map_err(RuntimeError::ExecutionError)?;
         // Read-before-write: existence + read-set entry (concurrent writer
         // aborts us at commit instead of clobbering).
+        let (physical, local) = self.server.route_id(table, id);
+        let local_id = RowId::new(local);
         let exists = self
             .server
             .tx_manager()
-            .get(&mut self.tx, table, RowId::new(id))
+            .get(&mut self.tx, &physical, local_id)
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
         if exists.is_none() {
             return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id)));
         }
         self.tx
-            .update(table.to_string(), RowId::new(id), values.clone())
+            .update(physical.clone(), local_id, values.clone())
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        let (shard, _) = BlitzServer::split_id(id);
         self.writes.push(ProcWrite {
-            table: table.to_string(),
+            base: table.to_string(),
+            physical,
+            shard,
             entry: blitz_wal::EntryType::Update,
             values: Some(values),
         });
@@ -915,19 +1005,24 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
     fn delete(&mut self, table: &str, id: u64) -> blitz_runtime::RuntimeResult<()> {
         use blitz_runtime::RuntimeError;
         self.deny(Op::Delete, table).map_err(RuntimeError::ExecutionError)?;
+        let (physical, local) = self.server.route_id(table, id);
+        let local_id = RowId::new(local);
         let exists = self
             .server
             .tx_manager()
-            .get(&mut self.tx, table, RowId::new(id))
+            .get(&mut self.tx, &physical, local_id)
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
         if exists.is_none() {
             return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id)));
         }
         self.tx
-            .delete(table.to_string(), RowId::new(id))
+            .delete(physical.clone(), local_id)
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
+        let (shard, _) = BlitzServer::split_id(id);
         self.writes.push(ProcWrite {
-            table: table.to_string(),
+            base: table.to_string(),
+            physical,
+            shard,
             entry: blitz_wal::EntryType::Delete,
             values: None,
         });
@@ -983,11 +1078,13 @@ fn execute_procedure(
         Ok(t) => t,
         Err(e) => return Response::err(id, format!("procedure aborted: {}", e)),
     };
-    // Zip commit-assigned ids back onto buffered writes in order.
+    // Zip commit-assigned LOCAL ids back onto buffered writes in order;
+    // responses and logs translate to global ids.
     let mut applied: Vec<serde_json::Value> = Vec::with_capacity(backend.writes.len());
-    for (w, (_, assigned)) in backend.writes.iter().zip(touched.iter()) {
-        emit_write_effects(server, &w.table, w.entry, assigned.as_u64(), w.values.as_ref());
-        applied.push(serde_json::json!({"table": w.table, "id": assigned.as_u64()}));
+    for (w, (_, local)) in backend.writes.iter().zip(touched.iter()) {
+        let global = BlitzServer::compose_id(w.shard, local.as_u64());
+        emit_write_effects(server, &w.base, &w.physical, w.entry, local.as_u64(), global, w.values.as_ref());
+        applied.push(serde_json::json!({"table": w.base, "id": global}));
     }
     let mut values: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
     match output.value {
@@ -1027,19 +1124,24 @@ fn json_to_value(v: serde_json::Value) -> Value {
 }
 
 /// Post-commit write effects shared by atomic batches and procedures:
-/// WAL append, change-log record, and social derived state (search index +
-/// fanout for `posts*` inserts). WAL failure bumps `wal_dropped` inside
-/// `wal_log` — the row is memory-committed (responses stay ok), durable at
-/// the next snapshot.
+/// WAL append (physical table, GLOBAL id — replay strips shard bits for the
+/// engine-local restore), change-log record (BASE name + global id, so
+/// Subscribe on stable names keeps working), and social derived state
+/// (search postings key on the physical table + LOCAL id for resolution;
+/// fanout jobs likewise). WAL failure bumps `wal_dropped` inside `wal_log` —
+/// the row is memory-committed (responses stay ok), durable at the next
+/// snapshot.
 fn emit_write_effects(
     server: &BlitzServer,
-    table: &str,
+    base: &str,
+    physical: &str,
     entry: blitz_wal::EntryType,
-    row_id: u64,
+    local_id: u64,
+    global_id: u64,
     values: Option<&std::collections::HashMap<String, Value>>,
 ) {
     let data = values.map(crate::durability::values_to_json_bytes).unwrap_or_default();
-    if server.wal_log(entry, table, row_id, data).is_err() {
+    if server.wal_log(entry, physical, global_id, data).is_err() {
         // Committed but unwritten: counted, stays until snapshot.
     }
     let op = match entry {
@@ -1048,14 +1150,14 @@ fn emit_write_effects(
         blitz_wal::EntryType::Delete => "delete",
         _ => "write",
     };
-    server.record_change(table, op, row_id);
-    if table.starts_with("posts") && matches!(entry, blitz_wal::EntryType::Insert) {
+    server.record_change(base, op, global_id);
+    if physical.starts_with("posts") && matches!(entry, blitz_wal::EntryType::Insert) {
         if let Some(v) = values {
             if let Some(Value::String(body)) = v.get("body") {
-                server.index_post(table, row_id, body);
+                server.index_post(physical, local_id, body);
             }
             if let Some(Value::String(author)) = v.get("author") {
-                server.fanout_enqueue(table.to_string(), row_id, author.clone());
+                server.fanout_enqueue(physical.to_string(), local_id, author.clone());
             }
         }
     }
@@ -1073,25 +1175,53 @@ fn encode_get_fast(
     req: &Request,
 ) -> anyhow::Result<bytes::Bytes> {
     let id = req.id;
-    let row_id = match req.row_id {
-        Some(rid) => RowId::new(rid),
+    let global = match req.row_id {
+        Some(rid) => rid,
         None => {
             return Ok(codec
                 .encode_response(&Response::err(id, "get requires row_id"))
                 .map_err(|e| anyhow::anyhow!("{e}"))?);
         }
     };
-    match server.engine().get_arc(&req.table, row_id) {
+    // Route by shard bits; echo the GLOBAL id (engine rows carry local ids).
+    let (physical, local) = server.route_id(&req.table, global);
+    match server.engine().get_arc(&physical, RowId::new(local)) {
         Ok(Some(row)) => Ok(codec
-            .encode_ok_single(id, row_id.as_u64(), &row.values)
+            .encode_ok_single(id, global, &row.values)
             .map_err(|e| anyhow::anyhow!("{e}"))?),
         Ok(None) => Ok(codec
-            .encode_response(&Response::err(id, format!("row not found: {}", row_id)))
+            .encode_response(&Response::err(id, format!("row not found: {}", RowId::new(global))))
             .map_err(|e| anyhow::anyhow!("{e}"))?),
         Err(e) => Ok(codec
             .encode_response(&Response::err(id, e.to_string()))
             .map_err(|e| anyhow::anyhow!("{e}"))?),
     }
+}
+
+/// Merge (global id, row) across all physical shards of a base table.
+/// Shared by the Single fast path and dispatch (one implementation, one
+/// ordering contract). Missing shard tables scan empty (fresh sharding).
+fn scan_merged(
+    server: &BlitzServer,
+    base: &str,
+) -> Result<Vec<(u64, std::sync::Arc<Row>)>, String> {
+    let mut merged: Vec<(u64, std::sync::Arc<Row>)> = Vec::new();
+    for (shard, physical) in server.shard_tables(base) {
+        match server.engine().scan_arcs(&physical) {
+            Ok(rows) => {
+                for r in rows {
+                    merged.push((BlitzServer::compose_id(shard, r.id.as_u64()), r));
+                }
+            }
+            Err(e) => {
+                if e.to_string().contains("table not found") {
+                    continue;
+                }
+                return Err(e.to_string());
+            }
+        }
+    }
+    Ok(merged)
 }
 
 fn encode_scan_fast(
@@ -1101,25 +1231,27 @@ fn encode_scan_fast(
 ) -> anyhow::Result<bytes::Bytes> {
     let id = req.id;
     let w = scan_pagination(&req.values);
-    match server.engine().scan_arcs(&req.table) {
-        Ok(mut rows) => {
-            if w.desc {
-                rows.sort_by_key(|r| std::cmp::Reverse(r.id));
-            } else {
-                rows.sort_by_key(|r| r.id);
-            }
-            let (start, end) = apply_window(rows.len(), !w.desc, &w, &|i| rows[i].id.as_u64());
-            let borrowed: Vec<(u64, &std::collections::HashMap<String, blitz_types::value::Value>)> =
-                rows[start..end].iter().map(|r| (r.id.as_u64(), &r.values)).collect();
-            match codec.encode_ok_borrowed(id, &borrowed) {
-                Ok(f) => Ok(f),
-                Err(_) => Ok(codec
-                    .encode_response(&Response::err(id, format!("response too large ({} rows)", borrowed.len())))
-                    .map_err(|e| anyhow::anyhow!("{e}"))?),
-            }
+    // Fan out across shards server-side (stable base names for callers).
+    let mut merged = match scan_merged(server, &req.table) {
+        Ok(m) => m,
+        Err(e) => {
+            return Ok(codec
+                .encode_response(&Response::err(id, e))
+                .map_err(|e| anyhow::anyhow!("{e}"))?)
         }
-        Err(e) => Ok(codec
-            .encode_response(&Response::err(id, e.to_string()))
+    };
+    if w.desc {
+        merged.sort_by_key(|r| std::cmp::Reverse(r.0));
+    } else {
+        merged.sort_by_key(|r| r.0);
+    }
+    let (start, end) = apply_window(merged.len(), !w.desc, &w, &|i| merged[i].0);
+    let borrowed: Vec<(u64, &std::collections::HashMap<String, blitz_types::value::Value>)> =
+        merged[start..end].iter().map(|(gid, r)| (*gid, &r.values)).collect();
+    match codec.encode_ok_borrowed(id, &borrowed) {
+        Ok(f) => Ok(f),
+        Err(_) => Ok(codec
+            .encode_response(&Response::err(id, format!("response too large ({} rows)", borrowed.len())))
             .map_err(|e| anyhow::anyhow!("{e}"))?),
     }
 }
@@ -2612,6 +2744,201 @@ mod tests {
         .await
         .unwrap();
         assert!(b.results.iter().all(|r| !r.ok), "nested call must abort: {:?}", b.results);
+    }
+
+    /// Sharded test server: `widgets` hashed by `owner` over 4 physicals.
+    /// Clients only ever see the base name; the wire carries global ids.
+    fn sharded_server() -> Arc<BlitzServer> {
+        use crate::server::{ServerConfig, ShardSpec};
+        use blitz_types::column::{ColumnDef, ColumnType};
+        use blitz_types::schema::TableSchema;
+        let mut cfg = ServerConfig::default();
+        cfg.table_shards.insert("widgets".into(), ShardSpec::new(4, "owner"));
+        let server = BlitzServer::with_config(cfg);
+        for s in 0..4 {
+            server
+                .engine()
+                .create_table(
+                    TableSchema::new(format!("widgets_{:02}", s))
+                        .with_column(ColumnDef::new("id", ColumnType::Int64).nullable())
+                        .with_column(ColumnDef::new("owner", ColumnType::String).nullable()),
+                )
+                .unwrap();
+        }
+        Arc::new(server)
+    }
+
+    fn widget_insert(id: u64, n: i64, owner: &str) -> Request {
+        Request {
+            id,
+            op: Op::Insert,
+            table: "widgets".into(),
+            row_id: None,
+            values: Some(values(&[
+                ("id", Value::Int64(n)),
+                ("owner", Value::String(owner.into())),
+            ])),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_routing_crud_by_global_id() {
+        let server = sharded_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Same owner always lands on the same shard (deterministic hash).
+        let mut shards = std::collections::HashSet::new();
+        let mut ids = Vec::new();
+        for (i, owner) in ["u0", "u1", "u2", "u3", "u0", "u1"].iter().enumerate() {
+            let r = client.roundtrip(&widget_insert(i as u64, i as i64, owner)).await.unwrap();
+            assert!(r.ok, "insert failed: {:?}", r.error);
+            let gid = r.rows[0].id;
+            ids.push((owner.to_string(), gid));
+            shards.insert(gid >> 56);
+        }
+        // Base name only on the wire; global ids route back correctly.
+        for (owner, gid) in &ids {
+            let g = client
+                .roundtrip(&Request { id: 100, op: Op::Get, table: "widgets".into(), row_id: Some(*gid), values: None })
+                .await
+                .unwrap();
+            assert!(g.ok && g.rows.len() == 1, "get {:?} failed: {:?}", gid, g.error);
+            assert_eq!(g.rows[0].values.get("owner"), Some(&Value::String(owner.clone())));
+            assert_eq!(g.rows[0].id, *gid, "response must echo the global id");
+        }
+        // Same-owner rows share a shard; distinct owners spread (hash).
+        let shard_of = |gid: u64| gid >> 56;
+        assert_eq!(shard_of(ids[0].1), shard_of(ids[4].1), "u0 must pin one shard");
+        assert_eq!(shard_of(ids[1].1), shard_of(ids[5].1), "u1 must pin one shard");
+        assert!(shards.len() > 1, "owners should spread: {:?}", shards);
+        // Physical tables hold all rows; base name holds none.
+        let total: usize = (0..4).map(|s| server.engine().count(&format!("widgets_{:02}", s)).unwrap()).sum();
+        assert_eq!(total, 6);
+        assert!(server.engine().count("widgets").is_err(), "base must not materialize");
+
+        // Update + delete by global id.
+        let u = client
+            .roundtrip(&Request {
+                id: 200,
+                op: Op::Update,
+                table: "widgets".into(),
+                row_id: Some(ids[0].1),
+                values: Some(values(&[("owner", Value::String("u0x".into()))])),
+            })
+            .await
+            .unwrap();
+        assert!(u.ok, "update failed: {:?}", u.error);
+        assert_eq!(u.rows[0].id, ids[0].1);
+        let d = client
+            .roundtrip(&Request { id: 201, op: Op::Delete, table: "widgets".into(), row_id: Some(ids[2].1), values: None })
+            .await
+            .unwrap();
+        assert!(d.ok, "delete failed: {:?}", d.error);
+        let g = client
+            .roundtrip(&Request { id: 202, op: Op::Get, table: "widgets".into(), row_id: Some(ids[2].1), values: None })
+            .await
+            .unwrap();
+        assert!(!g.ok, "deleted row must miss");
+    }
+
+    #[tokio::test]
+    async fn test_routing_scan_merges_shards() {
+        let server = sharded_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        for (i, owner) in ["u0", "u1", "u2", "u3", "u4"].iter().enumerate() {
+            let r = client.roundtrip(&widget_insert(i as u64, i as i64, owner)).await.unwrap();
+            assert!(r.ok, "insert failed: {:?}", r.error);
+        }
+        // Full scan on the base name merges every shard with global ids.
+        let s = client
+            .roundtrip(&Request {
+                id: 50,
+                op: Op::Scan,
+                table: "widgets".into(),
+                row_id: None,
+                values: Some(values(&[("_limit", Value::Int64(100))])),
+            })
+            .await
+            .unwrap();
+        assert!(s.ok && s.rows.len() == 5, "got {:?}", s.rows.len());
+        // Cursor pages don't overlap and stay ordered.
+        let p1 = client
+            .roundtrip(&Request {
+                id: 51,
+                op: Op::Scan,
+                table: "widgets".into(),
+                row_id: None,
+                values: Some(values(&[("_limit", Value::Int64(2)), ("_order", Value::String("desc".into()))])),
+            })
+            .await
+            .unwrap();
+        assert!(p1.ok && p1.rows.len() == 2, "got {:?}", p1);
+        assert!(p1.rows[0].id > p1.rows[1].id);
+        let cursor = p1.rows[1].id;
+        let p2 = client
+            .roundtrip(&Request {
+                id: 52,
+                op: Op::Scan,
+                table: "widgets".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("_limit", Value::Int64(10)),
+                    ("_order", Value::String("desc".into())),
+                    ("_cursor", Value::UInt64(cursor)),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(p2.ok, "got {:?}", p2.error);
+        assert!(!p2.rows.iter().any(|r| r.id == cursor || r.id == p1.rows[0].id));
+        assert!(p2.rows.iter().all(|r| r.id < cursor));
+    }
+
+    #[tokio::test]
+    async fn test_routing_atomic_batch_end_to_end() {
+        let server = sharded_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let seed = client.roundtrip(&widget_insert(1, 1, "seed")).await.unwrap();
+        assert!(seed.ok);
+        let gid = seed.rows[0].id;
+
+        // Atomic read-modify-write + insert, all by base name + global id.
+        let b = roundtrip_atomic(&mut client, 50, vec![
+            Request { id: 51, op: Op::Get, table: "widgets".into(), row_id: Some(gid), values: None },
+            Request {
+                id: 52,
+                op: Op::Update,
+                table: "widgets".into(),
+                row_id: Some(gid),
+                values: Some(values(&[("owner", Value::String("seed2".into()))])),
+            },
+            widget_insert(53, 2, "fresh"),
+        ])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|r| r.ok), "atomic routed batch must commit: {:?}", b.results);
+        assert_eq!(b.results[1].rows[0].values.get("owner"), Some(&Value::String("seed2".into())));
+        // New row got a global id on some shard; both rows Get-able by base.
+        let fresh_gid = b.results[2].rows[0].id;
+        for check in [gid, fresh_gid] {
+            let g = client
+                .roundtrip(&Request { id: 90, op: Op::Get, table: "widgets".into(), row_id: Some(check), values: None })
+                .await
+                .unwrap();
+            assert!(g.ok, "get {:?} failed", check);
+        }
     }
 
     #[tokio::test]

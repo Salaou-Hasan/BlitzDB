@@ -74,6 +74,15 @@ pub struct ServerConfig {
     /// identities map at `start`). Prefer short-lived tokens via
     /// `register_identity` for rotation without restart.
     pub auth_tokens: HashMap<String, Identity>,
+    /// Server-side sharding: `base -> (shard count, shard-key column)`.
+    /// Empty (default) = every table unsharded, today's behavior. App code
+    /// always uses BASE names; the server hashes `values[column] % N` on
+    /// insert and routes point ops by RowId shard bits. RowIds become
+    /// `(shard<<56)|local`: globally unique, locally engine-native.
+    /// Configure before data lands (no online resharding in v1); unique
+    /// indexes are per-shard (global uniqueness needs the shard key to be
+    /// the unique column, or unsharded tables).
+    pub table_shards: HashMap<String, ShardSpec>,
 }
 
 impl Default for ServerConfig {
@@ -94,8 +103,68 @@ impl Default for ServerConfig {
             max_connections_per_ip: 20_000,
             require_auth: false,
             auth_tokens: HashMap::new(),
+            table_shards: HashMap::new(),
         }
     }
+}
+
+/// Server-side sharding spec for one base table.
+#[derive(Debug, Clone)]
+pub struct ShardSpec {
+    /// Number of physical shards (`{base}_{shard:02}`).
+    pub shards: usize,
+    /// Row values column hashed for insert routing (`% shards`).
+    pub column: String,
+}
+
+impl ShardSpec {
+    pub fn new(shards: usize, column: impl Into<String>) -> Self {
+        Self { shards: shards.max(1), column: column.into() }
+    }
+}
+
+/// High 8 RowId bits carry the shard; low 56 are engine-local.
+pub const SHARD_SHIFT: u32 = 56;
+pub const LOCAL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
+
+/// Deterministic FNV-1a hash over a value's canonical bytes (insert routing
+/// must be stable across processes/restarts — `RandomState` is not).
+fn shard_hash(v: &Value) -> u64 {
+    const FNV_OFF: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut h = FNV_OFF;
+    let mut mix = |b: &[u8]| {
+        for byte in b {
+            h ^= *byte as u64;
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    match v {
+        Value::Boolean(b) => mix(&[*b as u8]),
+        Value::Int8(n) => mix(&n.to_le_bytes()),
+        Value::Int16(n) => mix(&n.to_le_bytes()),
+        Value::Int32(n) => mix(&n.to_le_bytes()),
+        Value::Int64(n) => mix(&n.to_le_bytes()),
+        Value::UInt8(n) => mix(&n.to_le_bytes()),
+        Value::UInt16(n) => mix(&n.to_le_bytes()),
+        Value::UInt32(n) => mix(&n.to_le_bytes()),
+        Value::UInt64(n) => mix(&n.to_le_bytes()),
+        Value::Float32(n) => mix(&n.to_le_bytes()),
+        Value::Float64(n) => mix(&n.to_le_bytes()),
+        Value::Decimal(s) | Value::String(s) => mix(s.as_bytes()),
+        Value::Bytes(b) => mix(b),
+        Value::Uuid(u) => mix(u.as_bytes()),
+        Value::Timestamp(t) => mix(&t.timestamp_micros().to_le_bytes()),
+        Value::Date(d) => mix(&d.to_string().as_bytes()),
+        Value::Json(j) => mix(j.to_string().as_bytes()),
+        Value::Array(a) => {
+            for item in a {
+                mix(&shard_hash(item).to_le_bytes());
+            }
+        }
+        Value::Null => mix(b"null"),
+    }
+    h
 }
 
 /// Point-in-time server stats for alerting / shedding.
@@ -242,6 +311,81 @@ impl BlitzServer {
 
     pub fn tx_manager(&self) -> &TransactionManager {
         &self.tx_manager
+    }
+
+    // -- Server-side routing (stable base names, sharded storage) --------
+
+    /// Shard count for a base table (1 = unsharded).
+    pub fn shard_count(&self, base: &str) -> usize {
+        self.config.table_shards.get(base).map(|s| s.shards).unwrap_or(1).max(1)
+    }
+
+    /// Physical table for (base, shard). Unsharded bases pass through;
+    /// sharded ones use the bench-compatible `{base}_{shard:02}` layout.
+    pub fn physical_table(&self, base: &str, shard: usize) -> String {
+        if self.shard_count(base) <= 1 {
+            base.to_string()
+        } else {
+            format!("{}_{:02}", base, shard)
+        }
+    }
+
+    /// All (shard, physical) pairs for fan-out reads, in shard order.
+    pub fn shard_tables(&self, base: &str) -> Vec<(usize, String)> {
+        let n = self.shard_count(base);
+        if n <= 1 {
+            vec![(0, base.to_string())]
+        } else {
+            (0..n).map(|s| (s, self.physical_table(base, s))).collect()
+        }
+    }
+
+    /// Shard owning a physical table name (parses the `_{NN}` suffix when
+    /// the base is sharded; 0 otherwise).
+    pub fn shard_of_physical(&self, base: &str, physical: &str) -> usize {
+        if self.shard_count(base) <= 1 || physical == base {
+            return 0;
+        }
+        physical
+            .rsplit_once('_')
+            .and_then(|(_, s)| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    /// Compose a global RowId from shard + engine-local id.
+    pub fn compose_id(shard: usize, local: u64) -> u64 {
+        (((shard as u64) & 0xFF) << SHARD_SHIFT) | (local & LOCAL_MASK)
+    }
+
+    /// Split a global RowId into (shard, local).
+    pub fn split_id(id: u64) -> (usize, u64) {
+        ((id >> SHARD_SHIFT) as usize, id & LOCAL_MASK)
+    }
+
+    /// Route an insert: hash `values[shard_column] % N`. Missing key hashes
+    /// as Null (deterministic single shard, documented — rows without a
+    /// shard key don't scatter).
+    pub fn route_insert(&self, base: &str, values: &HashMap<String, Value>) -> (String, usize) {
+        let n = self.shard_count(base);
+        if n <= 1 {
+            return (base.to_string(), 0);
+        }
+        let shard = match self.config.table_shards.get(base) {
+            Some(spec) => (shard_hash(values.get(&spec.column).unwrap_or(&Value::Null)) % n as u64) as usize,
+            None => 0,
+        };
+        (self.physical_table(base, shard), shard)
+    }
+
+    /// Route a point op by global RowId high bits. Legacy high-bits-0 ids
+    /// land on shard 0 (configure sharding before data lands).
+    pub fn route_id(&self, base: &str, id: u64) -> (String, u64) {
+        let n = self.shard_count(base);
+        if n <= 1 {
+            return (base.to_string(), id);
+        }
+        let (shard, local) = Self::split_id(id);
+        (self.physical_table(base, shard % n), local)
     }
 
     /// Register a server-side procedure for `Op::Call` (replaces same name).
