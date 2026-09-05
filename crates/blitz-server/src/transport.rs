@@ -268,15 +268,6 @@ fn enforce_owner(
 
 pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Request) -> Response {
     let id = req.id;
-    // Row-owner tables reject collection reads fail-closed (no silent
-    // row-dropping: pagination/counts would lie). Point reads stay available.
-    // Inactive without auth (bench default) — mirrors authorize_row.
-    if server.config().require_auth
-        && server.owner_column(&req.table).is_some()
-        && matches!(req.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search)
-    {
-        return Response::err(id, "collection reads disabled on row-owner tables (use point reads)");
-    }
     match req.op {
         Op::Ping => Response::ok(id, Vec::new()),
         Op::Insert => {
@@ -464,6 +455,13 @@ pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identit
                 Ok(m) => m,
                 Err(e) => return Response::err(id, e),
             };
+            // Row ownership: filter BEFORE sort/window so cursor pages over
+            // visible rows stay complete, ordered, and non-overlapping.
+            // (Atomic frames still reject Scan: tx snapshot semantics, not
+            // authz — unchanged.)
+            if server.owner_column(&req.table).is_some() {
+                merged.retain(|(_, row)| enforce_owner(server, authed, Op::Scan, &req.table, &row.values).is_ok());
+            }
             // Paginated + cursor scan over global RowId order. The limit
             // bounds CPU/frame; cursor (binary search) keeps pages stable
             // under concurrent inserts. NOTE: per-request full sort — hot
@@ -520,6 +518,10 @@ pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identit
             }
             match hit {
                 Some((shard, row)) => {
+                    // Owner mismatch reads as miss (no existence oracle).
+                    if enforce_owner(server, authed, Op::Find, &req.table, &row.values).is_err() {
+                        return Response::err(id, "not found");
+                    }
                     let global = BlitzServer::compose_id(shard, row.id.as_u64());
                     Response::ok(id, vec![row_to_view(RowId::new(global), &row)])
                 }
@@ -550,6 +552,22 @@ pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identit
                 }
             }
             let recs = server.read_changes(&req.table, since, limit);
+            // Row ownership: re-fetch each record's row and keep only owned
+            // ones. Gone rows (incl. deletes) drop fail-closed — ownership
+            // can't be proven without the row. Bounded: ≤ limit fetches.
+            // Limit applies pre-filter (bounded work); clients paginate by
+            // the returned max ts.
+            let recs: Vec<_> = if server.owner_column(&req.table).is_some() {
+                recs.into_iter().filter(|r| {
+                    let (physical, local) = server.route_id(&r.table, r.row_id);
+                    match server.engine().get_arc(&physical, RowId::new(local)) {
+                        Ok(Some(row)) => enforce_owner(server, authed, Op::Subscribe, &r.table, &row.values).is_ok(),
+                        _ => false,
+                    }
+                }).collect()
+            } else {
+                recs
+            };
             let rows = recs
                 .iter()
                 .map(|r| RowView {
@@ -589,11 +607,19 @@ pub(crate) fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identit
             };
             // Resolve postings to rows (bounded fan-out: ≤100 engine reads).
             // Postings carry (physical table, local id); responses carry
-            // GLOBAL ids so clients can Get them back.
+            // GLOBAL ids so clients can Get them back. Owner mismatch skips
+            // silently (same as already-missing rows: no oracle).
             let mut rows = Vec::new();
             for (table, rid) in server.search_posts(&q, limit) {
                 match server.engine().get_arc(&table, RowId::new(rid)) {
                     Ok(Some(row)) => {
+                        // Ownership is checked against the HIT's base table
+                        // (postings are global): owner-gated rows hide,
+                        // ungated tables pass through untouched.
+                        let hit_base = server.base_of_physical(&table);
+                        if enforce_owner(server, authed, Op::Search, &hit_base, &row.values).is_err() {
+                            continue;
+                        }
                         let shard = server.shard_of_physical(&req.table, &table);
                         let global = BlitzServer::compose_id(shard, rid);
                         rows.push(row_to_view(RowId::new(global), &row))
@@ -1340,17 +1366,13 @@ fn scan_merged(
 
 fn encode_scan_fast(
     server: &BlitzServer,
+    authed: &Option<blitz_auth::Identity>,
     codec: &FrameCodec,
     req: &Request,
 ) -> anyhow::Result<bytes::Bytes> {
     let id = req.id;
-    // Row-owner tables reject collection reads fail-closed (same rule as
-    // dispatch; the fast path must not bypass it).
-    if server.config().require_auth && server.owner_column(&req.table).is_some() {
-        return Ok(codec
-            .encode_response(&Response::err(id, "collection reads disabled on row-owner tables (use point reads)"))
-            .map_err(|e| anyhow::anyhow!("{e}"))?);
-    }
+    // Row-owner tables: filter merged rows by owner BEFORE windowing, so
+    // pages/cursors stay honest (complete, ordered, non-overlapping).
     let w = scan_pagination(&req.values);
     // Fan out across shards server-side (stable base names for callers).
     let mut merged = match scan_merged(server, &req.table) {
@@ -1361,6 +1383,9 @@ fn encode_scan_fast(
                 .map_err(|e| anyhow::anyhow!("{e}"))?)
         }
     };
+    if server.owner_column(&req.table).is_some() {
+        merged.retain(|(_, row)| enforce_owner(server, authed, Op::Scan, &req.table, &row.values).is_ok());
+    }
     if w.desc {
         merged.sort_by_key(|r| std::cmp::Reverse(r.0));
     } else {
@@ -1475,11 +1500,12 @@ async fn handle_stream(
                         server.record_io(0, err.len() as u64);
                         return Ok(());
                     }
-                    // Row-owner tables stay off push streams too (per-row
-                    // filtering doesn't exist in v1 — fail closed).
+                    // Row-owner tables stay off push streams: broadcast delivery
+                    // can't enforce per-row ownership without putting engine
+                    // reads on the write path — poll instead (fail closed).
                     if server.config().require_auth && server.owner_column(&req.table).is_some() {
                         let rid = req.id;
-                        let err = codec.encode_response(&Response::err(rid, "collection reads disabled on row-owner tables (use point reads)")).context("encode error")?;
+                        let err = codec.encode_response(&Response::err(rid, "push streams disabled on row-owner tables (poll instead)")).context("encode error")?;
                         stream.write_all(&err).await.context("failed to write to socket")?;
                         server.record_io(0, err.len() as u64);
                         return Ok(());
@@ -1508,7 +1534,7 @@ async fn handle_stream(
                     } else if req.op == Op::Get {
                         encode_get_fast(&server, &authed, &codec, &req).context("encode error")?
                     } else if req.op == Op::Scan {
-                        encode_scan_fast(&server, &codec, &req).context("encode error")?
+                        encode_scan_fast(&server, &authed, &codec, &req).context("encode error")?
                     } else {
                         let resp = dispatch(&server, &authed, req);
                         // A giant response could exceed the frame budget;
@@ -2969,9 +2995,14 @@ mod tests {
         }
     }
 
-    /// Auth server: require_auth + `docs` owned by its `owner` column.
-    /// Tokens: alice/bob long-lived, admin long-lived, sess-* sessions.
+    /// Auth server: require_auth + `docs` owned by its `owner` column,
+    /// plus any extra `row_owner` entries. Tokens: alice/bob long-lived,
+    /// admin long-lived, sess-* sessions.
     fn owned_server() -> Arc<BlitzServer> {
+        owned_server_with(&[])
+    }
+
+    fn owned_server_with(extra_owner: &[(&str, &str)]) -> Arc<BlitzServer> {
         use crate::server::ServerConfig;
         use blitz_auth::{Identity, Permission};
         use blitz_types::column::{ColumnDef, ColumnType};
@@ -2979,6 +3010,9 @@ mod tests {
         let mut cfg = ServerConfig::default();
         cfg.require_auth = true;
         cfg.row_owner.insert("docs".into(), "owner".into());
+        for (t, c) in extra_owner {
+            cfg.row_owner.insert(t.to_string(), c.to_string());
+        }
         let server = BlitzServer::with_config(cfg);
         server
             .engine()
@@ -3061,20 +3095,17 @@ mod tests {
         let a = client.roundtrip(&authed_req(8, Op::Get, "docs", "tok-admin", Some(gid), vec![])).await.unwrap();
         assert!(a.ok, "admin get failed: {:?}", a.error);
 
-        // Collection reads fail closed on row-owner tables.
+        // Collection reads filter by owner (no fail-closed, no leaks).
         let s = client
             .roundtrip(&authed_req(9, Op::Scan, "docs", "tok-alice", None, vec![("_limit".to_string(), Value::Int64(10))]))
             .await
             .unwrap();
-        assert!(!s.ok && s.error.as_deref().unwrap_or("").contains("disabled"), "got {:?}", s);
-        let f2 = client
-            .roundtrip(&authed_req(10, Op::Find, "docs", "tok-alice", None, vec![
-                ("_col".to_string(), Value::String("owner".into())),
-                ("_val".to_string(), Value::String("alice".into())),
-            ]))
+        assert!(s.ok && s.rows.len() == 1, "alice sees only hers: {:?}", s);
+        let s = client
+            .roundtrip(&authed_req(10, Op::Scan, "docs", "tok-bob", None, vec![("_limit".to_string(), Value::Int64(10))]))
             .await
             .unwrap();
-        assert!(!f2.ok, "find must fail closed: {:?}", f2);
+        assert!(s.ok && s.rows.is_empty(), "bob sees none: {:?}", s);
     }
 
     #[tokio::test]
@@ -3137,6 +3168,195 @@ mod tests {
             .unwrap();
         assert!(b.results.iter().all(|r| !r.ok), "atomic must abort all: {:?}", b.results);
         assert_eq!(server.engine().count("docs").unwrap(), 2, "only bob's two plain-batch rows");
+    }
+
+    async fn seed_doc(client: &mut Client, id: u64, tok: &str, owner: &str, body: &str) -> u64 {
+        let r = client
+            .roundtrip(&authed_req(id, Op::Insert, "docs", tok, None, vec![
+                ("id".to_string(), Value::Int64(id as i64)),
+                ("owner".to_string(), Value::String(owner.into())),
+                ("body".to_string(), Value::String(body.into())),
+            ]))
+            .await
+            .unwrap();
+        assert!(r.ok, "seed failed: {:?}", r.error);
+        r.rows[0].id
+    }
+
+    #[tokio::test]
+    async fn test_row_filtered_scan_pagination() {
+        let server = owned_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        // Interleave owners: alice ×4, bob ×3.
+        for i in 0..4u64 {
+            seed_doc(&mut client, 10 + i, "tok-alice", "alice", "a").await;
+        }
+        for i in 0..3u64 {
+            seed_doc(&mut client, 20 + i, "tok-bob", "bob", "b").await;
+        }
+        let scan = |id: u64, tok: &str, lim: i64, extra: Vec<(String, Value)>| {
+            let mut vals = vec![("_limit".to_string(), Value::Int64(lim))];
+            vals.extend(extra);
+            authed_req(id, Op::Scan, "docs", tok, None, vals)
+        };
+        // Alice pages desc limit 2: complete (4), ordered, no overlap.
+        let p1 = client.roundtrip(&scan(50, "tok-alice", 2, vec![
+            ("_order".to_string(), Value::String("desc".into())),
+        ])).await.unwrap();
+        assert!(p1.ok && p1.rows.len() == 2, "got {:?}", p1);
+        assert!(p1.rows[0].id > p1.rows[1].id);
+        assert!(p1.rows.iter().all(|r| r.values.get("owner") == Some(&Value::String("alice".into()))));
+        let cursor = p1.rows[1].id;
+        let p2 = client.roundtrip(&scan(51, "tok-alice", 10, vec![
+            ("_order".to_string(), Value::String("desc".into())),
+            ("_cursor".to_string(), Value::UInt64(cursor)),
+        ])).await.unwrap();
+        assert!(p2.ok && p2.rows.len() == 2, "got {:?}", p2);
+        assert!(p2.rows.iter().all(|r| r.id < cursor));
+        assert!(!p2.rows.iter().any(|r| r.id == p1.rows[0].id));
+        // Bob sees exactly his 3, asc full scan.
+        let b = client.roundtrip(&scan(52, "tok-bob", 100, vec![])).await.unwrap();
+        assert!(b.ok && b.rows.len() == 3, "got {:?}", b);
+        assert!(b.rows.iter().all(|r| r.values.get("owner") == Some(&Value::String("bob".into()))));
+    }
+
+    #[tokio::test]
+    async fn test_row_filtered_find_and_subscribe() {
+        use blitz_types::column::{ColumnDef, ColumnType};
+        use blitz_types::schema::TableSchema;
+        // Notes: slug unique (Find-able) AND owner-gated via config.
+        let server = owned_server_with(&[("notes", "owner")]);
+        server.start().await.unwrap();
+        server
+            .engine()
+            .create_table(
+                TableSchema::new("notes")
+                    .with_column(ColumnDef::new("id", ColumnType::Int64).nullable())
+                    .with_column(ColumnDef::new("owner", ColumnType::String).nullable())
+                    .with_column(ColumnDef::new("slug", ColumnType::String).unique()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let note = |id: u64, tok: &str, owner: &str, slug: &str| authed_req(id, Op::Insert, "notes", tok, None, vec![
+            ("id".to_string(), Value::Int64(id as i64)),
+            ("owner".to_string(), Value::String(owner.into())),
+            ("slug".to_string(), Value::String(slug.into())),
+        ]);
+        for (i, (tok, owner, slug)) in [("tok-alice", "alice", "a1"), ("tok-bob", "bob", "b1")].iter().enumerate() {
+            let r = client.roundtrip(&note(60 + i as u64, tok, owner, slug)).await.unwrap();
+            assert!(r.ok, "seed failed: {:?}", r.error);
+        }
+        // Bob finds his own slug; alice's slug hides as miss.
+        let f = client
+            .roundtrip(&authed_req(70, Op::Find, "notes", "tok-bob", None, vec![
+                ("_col".to_string(), Value::String("slug".into())),
+                ("_val".to_string(), Value::String("b1".into())),
+            ]))
+            .await
+            .unwrap();
+        assert!(f.ok, "own find failed: {:?}", f.error);
+        let f = client
+            .roundtrip(&authed_req(71, Op::Find, "notes", "tok-bob", None, vec![
+                ("_col".to_string(), Value::String("slug".into())),
+                ("_val".to_string(), Value::String("a1".into())),
+            ]))
+            .await
+            .unwrap();
+        assert!(!f.ok, "foreign find must miss: {:?}", f);
+        // Subscribe poll on docs (gated): arm the change-log with an empty
+        // poll first (records only exist after first Subscribe), then seed.
+        let sub = |id: u64, tok: &str| authed_req(id, Op::Subscribe, "docs", tok, None, vec![
+            ("_since".to_string(), Value::Int64(0)),
+            ("_limit".to_string(), Value::Int64(100)),
+        ]);
+        let arm = client.roundtrip(&sub(79, "tok-alice")).await.unwrap();
+        assert!(arm.ok, "arm poll failed: {:?}", arm.error);
+        seed_doc(&mut client, 80, "tok-alice", "alice", "a").await;
+        seed_doc(&mut client, 81, "tok-bob", "bob", "b").await;
+        let pa = client.roundtrip(&sub(82, "tok-alice")).await.unwrap();
+        assert!(pa.ok, "poll failed: {:?}", pa.error);
+        assert!(!pa.rows.is_empty(), "alice should see her records");
+        for r in &pa.rows {
+            let rid = match r.values.get("row_id") {
+                Some(Value::Int64(n)) => *n as u64,
+                _ => panic!("record missing row_id: {:?}", r),
+            };
+            let row = server.engine().get("docs", RowId::new(rid)).unwrap().unwrap();
+            assert_eq!(row.values.get("owner"), Some(&Value::String("alice".into())), "leak in poll");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_row_filtered_search_and_push_closed() {
+        use blitz_types::column::{ColumnDef, ColumnType};
+        use blitz_types::schema::TableSchema;
+        // posts_team: indexed (posts* prefix) AND owner-gated, authed.
+        let server = owned_server_with(&[("posts_team", "owner")]);
+        server.start().await.unwrap();
+        server
+            .engine()
+            .create_table(
+                TableSchema::new("posts_team")
+                    .with_column(ColumnDef::new("id", ColumnType::Int64).nullable())
+                    .with_column(ColumnDef::new("owner", ColumnType::String).nullable())
+                    .with_column(ColumnDef::new("body", ColumnType::String).nullable()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let post = |id: u64, tok: &str, owner: &str, body: &str| authed_req(id, Op::Insert, "posts_team", tok, None, vec![
+            ("id".to_string(), Value::Int64(id as i64)),
+            ("owner".to_string(), Value::String(owner.into())),
+            ("body".to_string(), Value::String(body.into())),
+        ]);
+        for (i, (tok, o, b)) in [
+            ("tok-alice", "alice", "xylophone dreams quartz"),
+            ("tok-bob", "bob", "zephyr nights quartz"),
+        ].iter().enumerate() {
+            let r = client.roundtrip(&post(90 + i as u64, tok, o, b)).await.unwrap();
+            assert!(r.ok, "seed failed: {:?}", r.error);
+        }
+        let search = |id: u64, tok: &str, q: &str| authed_req(id, Op::Search, "posts_team", tok, None, vec![
+            ("_q".to_string(), Value::String(q.into())),
+            ("_limit".to_string(), Value::Int64(20)),
+        ]);
+        // Own term hits; shared term shows only hers; foreign term blinds.
+        let r = client.roundtrip(&search(95, "tok-alice", "xylophone")).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        let r = client.roundtrip(&search(96, "tok-alice", "quartz")).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        let r = client.roundtrip(&search(97, "tok-bob", "xylophone")).await.unwrap();
+        assert!(r.ok && r.rows.is_empty(), "leak: {:?}", r);
+        let r = client.roundtrip(&search(98, "tok-bob", "quartz")).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        // Push upgrade on a gated table stays rejected (poll instead).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let sock = TcpStream::connect(addr).await.unwrap();
+        sock.set_nodelay(true).unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        let codec = FrameCodec::with_default_limit();
+        let frame = codec.encode_request(&authed_req(99, Op::Subscribe, "posts_team", "tok-alice", None, vec![
+            ("_stream".to_string(), Value::Int64(1)),
+        ])).unwrap();
+        wr.write_all(&frame).await.unwrap();
+        let mut buf = BytesMut::new();
+        let resp = loop {
+            if let Some(p) = codec.feed(&mut buf).unwrap() {
+                break codec.decode_response(p).unwrap();
+            }
+            assert!(rd.read_buf(&mut buf).await.unwrap() > 0);
+        };
+        assert!(!resp.ok && resp.error.as_deref().unwrap_or("").contains("push streams disabled"),
+            "got {:?}", resp);
     }
 
     #[tokio::test]

@@ -370,10 +370,27 @@ impl BlitzServer {
         }
     }
 
+    /// Base table owning a physical name: reverses `{base}_{NN}` for
+    /// configured sharded bases, else identity. Used where only the
+    /// physical name survives (search postings).
+    pub fn base_of_physical(&self, physical: &str) -> String {
+        if let Some((base, _)) = physical.rsplit_once('_') {
+            if let Some(spec) = self.config.table_shards.get(base) {
+                if spec.shards > 1 {
+                    if physical.len() > base.len() + 1
+                        && physical[base.len() + 1..].chars().all(|c| c.is_ascii_digit())
+                    {
+                        return base.to_string();
+                    }
+                }
+            }
+        }
+        physical.to_string()
+    }
+
     /// Shard owning a physical table name (parses the `_{NN}` suffix when
     /// the base is sharded; 0 otherwise).
-    pub fn shard_of_physical(&self, base: &str, physical: &str) -> usize {
-        if self.shard_count(base) <= 1 || physical == base {
+    pub fn shard_of_physical(&self, base: &str, physical: &str) -> usize {        if self.shard_count(base) <= 1 || physical == base {
             return 0;
         }
         physical

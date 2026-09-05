@@ -119,9 +119,14 @@ The server runs the registered procedure's steps in one OCC transaction
   others' rows hide as `row not found` (no existence oracle); writes deny
   with `forbidden`. Applies to single ops, atomic batches, and procedure
   steps alike.
-- Collection reads (`Scan`/`Find`/`Subscribe`/`Search`/push streams) on
-  row-owner tables fail closed — use point reads. (Query-time filtering is
-  future work; v1 refuses to silently drop rows.)
+- Collection reads on gated tables FILTER by owner (no fail-closed, no
+  leaks): `Scan` filters before windowing (cursor pages stay complete,
+  ordered, non-overlapping); `Find` mismatches read as miss; `Subscribe`
+  polls re-fetch each record (≤ limit reads; gone rows drop) with the
+  limit applying pre-filter; `Search` skips foreign hits silently.
+  Push streams stay rejected (broadcast can't enforce per-row ownership
+  without engine reads on the write path — poll instead). Atomic frames
+  still reject collection ops (tx snapshot semantics, unchanged).
 
 ## HTTP bridge (`serve_http_ops`)
 
