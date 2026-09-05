@@ -249,8 +249,34 @@ fn apply_window(len: usize, ids_asc: bool, w: &ScanWindow, id_at: &dyn Fn(usize)
 /// Plain retried Inserts without `_idem` may duplicate. Interactive
 /// transactions (begin/commit over TCP) are not yet exposed; `active_tx`
 /// reports 0 honestly.
+/// Row-level ownership gate: no-op when the table has no owner column
+/// (or auth is bypassed / caller is admin). Otherwise the values' owner
+/// must equal the caller's subject. Call AFTER table-level authorize.
+fn enforce_owner(
+    server: &BlitzServer,
+    authed: &Option<blitz_auth::Identity>,
+    op: Op,
+    base: &str,
+    values: &std::collections::HashMap<String, Value>,
+) -> Result<(), &'static str> {
+    let col = match server.owner_column(base) {
+        Some(c) => c,
+        None => return Ok(()),
+    };
+    server.authorize_row(authed, op, base, values.get(&col))
+}
+
 fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Request) -> Response {
     let id = req.id;
+    // Row-owner tables reject collection reads fail-closed (no silent
+    // row-dropping: pagination/counts would lie). Point reads stay available.
+    // Inactive without auth (bench default) — mirrors authorize_row.
+    if server.config().require_auth
+        && server.owner_column(&req.table).is_some()
+        && matches!(req.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search)
+    {
+        return Response::err(id, "collection reads disabled on row-owner tables (use point reads)");
+    }
     match req.op {
         Op::Ping => Response::ok(id, Vec::new()),
         Op::Insert => {
@@ -279,6 +305,10 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                 if let Some(cached) = server.idem_lookup(key) {
                     return Response::ok(id, vec![RowView { id: cached, values }]);
                 }
+            }
+            // Row ownership: writers can only create their own rows.
+            if let Err(e) = enforce_owner(server, authed, Op::Insert, &req.table, &values) {
+                return Response::err(id, e);
             }
             // Server-side routing: base name in, (physical, shard) out.
             // Unsharded tables pass through identically (shard 0, local id).
@@ -339,8 +369,14 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
             };
             let (physical, local) = server.route_id(&req.table, global);
             // Zero-copy read: serialize straight off the shared handle.
+            // Row-owner mismatch hides as "not found" (no existence oracle).
             match server.engine().get_arc(&physical, RowId::new(local)) {
-                Ok(Some(row)) => Response::ok(id, vec![row_to_view(RowId::new(global), &row)]),
+                Ok(Some(row)) => {
+                    if enforce_owner(server, authed, Op::Get, &req.table, &row.values).is_err() {
+                        return Response::err(id, format!("row not found: {}", RowId::new(global)));
+                    }
+                    Response::ok(id, vec![row_to_view(RowId::new(global), &row)])
+                }
                 Ok(None) => Response::err(id, format!("row not found: {}", RowId::new(global))),
                 Err(e) => Response::err(id, e.to_string()),
             }
@@ -355,6 +391,20 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                 Some(v) => v,
                 None => return Response::err(id, "update requires values"),
             };
+            // Row ownership pre-check (one extra read, only on configured
+            // tables with auth on): never mutate another owner's row.
+            if server.config().require_auth && server.owner_column(&req.table).is_some() {
+                match server.engine().get_arc(&physical, RowId::new(local)) {
+                    Ok(Some(row)) => {
+                        if let Err(e) = enforce_owner(server, authed, Op::Update, &req.table, &row.values) {
+                            return Response::err(id, e);
+                        }
+                    }
+                    // Absent: fall through to engine.update for the exact
+                    // current "row not found" behavior.
+                    _ => {}
+                }
+            }
             // Move, don't clone: engine already returns an owned Row, so
             // moving its map into the view saves a second HashMap clone.
             // Response id is the GLOBAL id (engine rows carry local ids).
@@ -382,6 +432,17 @@ fn dispatch(server: &BlitzServer, authed: &Option<blitz_auth::Identity>, req: Re
                 None => return Response::err(id, "delete requires row_id"),
             };
             let (physical, local) = server.route_id(&req.table, global);
+            // Row ownership pre-check (configured tables with auth on).
+            if server.config().require_auth && server.owner_column(&req.table).is_some() {
+                match server.engine().get_arc(&physical, RowId::new(local)) {
+                    Ok(Some(row)) => {
+                        if let Err(e) = enforce_owner(server, authed, Op::Delete, &req.table, &row.values) {
+                            return Response::err(id, e);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             match server.engine().delete(&physical, RowId::new(local)) {
                 Ok(true) => {
                     if let Err(w) = server.wal_log(blitz_wal::EntryType::Delete, &physical, global, Vec::new()) {
@@ -660,7 +721,12 @@ fn execute_atomic(
                 let (physical, local) = server.route_id(&op.table, global);
                 let local_id = RowId::new(local);
                 match server.tx_manager().get(&mut tx, &physical, local_id) {
-                    Ok(Some(row)) => buffered.push((rid, Buffered::Get { view: row_to_view(RowId::new(global), &row) })),
+                    Ok(Some(row)) => {
+                        if enforce_owner(server, authed, Op::Get, &op.table, &row.values).is_err() {
+                            return fail(&mut tx, rid, format!("row not found: {}", local_id));
+                        }
+                        buffered.push((rid, Buffered::Get { view: row_to_view(RowId::new(global), &row) }))
+                    }
                     Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", local_id)),
                     Err(e) => return fail(&mut tx, rid, e.to_string()),
                 }
@@ -694,7 +760,11 @@ fn execute_atomic(
                 // Intra-batch duplicate pre-check against live unique indexes.
                 // Engine owns the index truth; ask it per unique column.
                 // Unique scope is the PHYSICAL table (per-shard uniqueness).
+                // Row ownership gates the values before buffering.
                 let (physical, shard) = server.route_insert(&op.table, &values);
+                if let Err(e) = enforce_owner(server, authed, Op::Insert, &op.table, &values) {
+                    return fail(&mut tx, rid, e.to_string());
+                }
                 if let Ok(schema) = server.engine().schema(&physical) {
                     for col in schema.columns.iter().filter(|c| c.unique) {
                         if let Some(v) = values.get(&col.name) {
@@ -738,8 +808,13 @@ fn execute_atomic(
                 };
                 // Read-before-write: existence check + read-set entry, so a
                 // concurrent writer aborts us at commit instead of clobbering.
+                // Row ownership rides on the same read (fail forbidden).
                 match server.tx_manager().get(&mut tx, &physical, local_id) {
-                    Ok(Some(_)) => {}
+                    Ok(Some(row)) => {
+                        if let Err(e) = enforce_owner(server, authed, Op::Update, &op.table, &row.values) {
+                            return fail(&mut tx, rid, e.to_string());
+                        }
+                    }
                     Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", local_id)),
                     Err(e) => return fail(&mut tx, rid, e.to_string()),
                 }
@@ -757,7 +832,11 @@ fn execute_atomic(
                 let (physical, local) = server.route_id(&op.table, global);
                 let local_id = RowId::new(local);
                 match server.tx_manager().get(&mut tx, &physical, local_id) {
-                    Ok(Some(_)) => {}
+                    Ok(Some(row)) => {
+                        if let Err(e) = enforce_owner(server, authed, Op::Delete, &op.table, &row.values) {
+                            return fail(&mut tx, rid, e.to_string());
+                        }
+                    }
                     Ok(None) => return fail(&mut tx, rid, format!("row not found: {}", local_id)),
                     Err(e) => return fail(&mut tx, rid, e.to_string()),
                 }
@@ -887,6 +966,15 @@ impl<'s> ProcBackend<'s> {
         self.server.authorize(&self.ident, op, table).map_err(|e| e.to_string())
     }
 
+    fn deny_row(
+        &self,
+        op: Op,
+        table: &str,
+        values: &std::collections::HashMap<String, Value>,
+    ) -> Result<(), String> {
+        enforce_owner(self.server, &self.ident, op, table, values).map_err(|e| e.to_string())
+    }
+
     fn check_unique(
         &mut self,
         table: &str,
@@ -928,13 +1016,20 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
         use blitz_runtime::RuntimeError;
         self.deny(Op::Get, table).map_err(RuntimeError::ExecutionError)?;
         // Point reads route by global-id shard bits (base names in steps).
+        // Owner mismatch hides as miss (no existence oracle).
         let (physical, local) = self.server.route_id(table, id);
         let row = self
             .server
             .tx_manager()
             .get(&mut self.tx, &physical, RowId::new(local))
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
-        Ok(row.map(|r| r.values))
+        match row {
+            Some(r) => {
+                self.deny_row(Op::Get, table, &r.values).map_err(RuntimeError::ExecutionError)?;
+                Ok(Some(r.values))
+            }
+            None => Ok(None),
+        }
     }
 
     fn insert(
@@ -953,6 +1048,7 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
         }
         let (physical, shard) = self.server.route_insert(table, &values);
         self.check_unique(&physical, &values).map_err(RuntimeError::ExecutionError)?;
+        self.deny_row(Op::Insert, table, &values).map_err(RuntimeError::ExecutionError)?;
         let mut row = Row::new(RowId::new(0));
         for (k, v) in &values {
             row.set(k.clone(), v.clone());
@@ -987,9 +1083,11 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
             .tx_manager()
             .get(&mut self.tx, &physical, local_id)
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
-        if exists.is_none() {
-            return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id)));
-        }
+        let existing = match exists {
+            Some(r) => r,
+            None => return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id))),
+        };
+        self.deny_row(Op::Update, table, &existing.values).map_err(RuntimeError::ExecutionError)?;
         self.tx
             .update(physical.clone(), local_id, values.clone())
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
@@ -1014,9 +1112,11 @@ impl blitz_runtime::ProcedureBackend for ProcBackend<'_> {
             .tx_manager()
             .get(&mut self.tx, &physical, local_id)
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
-        if exists.is_none() {
-            return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id)));
-        }
+        let existing = match exists {
+            Some(r) => r,
+            None => return Err(RuntimeError::ExecutionError(format!("row not found: {}:{}", table, id))),
+        };
+        self.deny_row(Op::Delete, table, &existing.values).map_err(RuntimeError::ExecutionError)?;
         self.tx
             .delete(physical.clone(), local_id)
             .map_err(|e| RuntimeError::ExecutionError(e.to_string()))?;
@@ -1173,6 +1273,7 @@ fn emit_write_effects(
 /// of Get/Scan service time. Insert/Update/Delete stay on `dispatch`.
 fn encode_get_fast(
     server: &BlitzServer,
+    authed: &Option<blitz_auth::Identity>,
     codec: &FrameCodec,
     req: &Request,
 ) -> anyhow::Result<bytes::Bytes> {
@@ -1186,11 +1287,19 @@ fn encode_get_fast(
         }
     };
     // Route by shard bits; echo the GLOBAL id (engine rows carry local ids).
+    // Row-owner mismatch hides as "not found" (no existence oracle).
     let (physical, local) = server.route_id(&req.table, global);
     match server.engine().get_arc(&physical, RowId::new(local)) {
-        Ok(Some(row)) => Ok(codec
-            .encode_ok_single(id, global, &row.values)
-            .map_err(|e| anyhow::anyhow!("{e}"))?),
+        Ok(Some(row)) => {
+            if enforce_owner(server, authed, Op::Get, &req.table, &row.values).is_err() {
+                return Ok(codec
+                    .encode_response(&Response::err(id, format!("row not found: {}", RowId::new(global))))
+                    .map_err(|e| anyhow::anyhow!("{e}"))?);
+            }
+            Ok(codec
+                .encode_ok_single(id, global, &row.values)
+                .map_err(|e| anyhow::anyhow!("{e}"))?)
+        }
         Ok(None) => Ok(codec
             .encode_response(&Response::err(id, format!("row not found: {}", RowId::new(global))))
             .map_err(|e| anyhow::anyhow!("{e}"))?),
@@ -1235,6 +1344,13 @@ fn encode_scan_fast(
     req: &Request,
 ) -> anyhow::Result<bytes::Bytes> {
     let id = req.id;
+    // Row-owner tables reject collection reads fail-closed (same rule as
+    // dispatch; the fast path must not bypass it).
+    if server.config().require_auth && server.owner_column(&req.table).is_some() {
+        return Ok(codec
+            .encode_response(&Response::err(id, "collection reads disabled on row-owner tables (use point reads)"))
+            .map_err(|e| anyhow::anyhow!("{e}"))?);
+    }
     let w = scan_pagination(&req.values);
     // Fan out across shards server-side (stable base names for callers).
     let mut merged = match scan_merged(server, &req.table) {
@@ -1359,6 +1475,15 @@ async fn handle_stream(
                         server.record_io(0, err.len() as u64);
                         return Ok(());
                     }
+                    // Row-owner tables stay off push streams too (per-row
+                    // filtering doesn't exist in v1 — fail closed).
+                    if server.config().require_auth && server.owner_column(&req.table).is_some() {
+                        let rid = req.id;
+                        let err = codec.encode_response(&Response::err(rid, "collection reads disabled on row-owner tables (use point reads)")).context("encode error")?;
+                        stream.write_all(&err).await.context("failed to write to socket")?;
+                        server.record_io(0, err.len() as u64);
+                        return Ok(());
+                    }
                     let (rid, table) = (req.id, req.table.clone());
                     return run_push_stream(&server, &mut stream, &codec, rid, table, idle_secs).await;
                 }
@@ -1381,7 +1506,7 @@ async fn handle_stream(
                         let rid = req.id;
                         codec.encode_response(&Response::err(rid, e)).context("encode error")?
                     } else if req.op == Op::Get {
-                        encode_get_fast(&server, &codec, &req).context("encode error")?
+                        encode_get_fast(&server, &authed, &codec, &req).context("encode error")?
                     } else if req.op == Op::Scan {
                         encode_scan_fast(&server, &codec, &req).context("encode error")?
                     } else {
@@ -2784,6 +2909,176 @@ mod tests {
                 ("owner", Value::String(owner.into())),
             ])),
         }
+    }
+
+    /// Auth server: require_auth + `docs` owned by its `owner` column.
+    /// Tokens: alice/bob long-lived, admin long-lived, sess-* sessions.
+    fn owned_server() -> Arc<BlitzServer> {
+        use crate::server::ServerConfig;
+        use blitz_auth::{Identity, Permission};
+        use blitz_types::column::{ColumnDef, ColumnType};
+        use blitz_types::schema::TableSchema;
+        let mut cfg = ServerConfig::default();
+        cfg.require_auth = true;
+        cfg.row_owner.insert("docs".into(), "owner".into());
+        let server = BlitzServer::with_config(cfg);
+        server
+            .engine()
+            .create_table(
+                TableSchema::new("docs")
+                    .with_column(ColumnDef::new("id", ColumnType::Int64).nullable())
+                    .with_column(ColumnDef::new("owner", ColumnType::String).nullable())
+                    .with_column(ColumnDef::new("body", ColumnType::String).nullable()),
+            )
+            .unwrap();
+        let user = |subject: &str| {
+            Identity::new(subject)
+                .with_permission(Permission::Read)
+                .with_permission(Permission::Write)
+                .with_permission(Permission::Delete)
+        };
+        server.register_identity("tok-alice".into(), user("alice"));
+        server.register_identity("tok-bob".into(), user("bob"));
+        server.register_identity("tok-admin".into(), Identity::new("root").with_role("admin"));
+        server.register_session("sess-alice".into(), user("alice"), 3600);
+        server.register_session("sess-dead".into(), user("alice"), 0);
+        Arc::new(server)
+    }
+
+    fn authed_req(id: u64, op: Op, table: &str, tok: &str, row_id: Option<u64>, vals: Vec<(String, Value)>) -> Request {
+        let mut all: Vec<(String, Value)> = vec![("_auth".to_string(), Value::String(tok.into()))];
+        all.extend(vals);
+        let map: std::collections::HashMap<String, Value> = all.into_iter().collect();
+        Request { id, op, table: table.into(), row_id, values: Some(map) }
+    }
+
+    fn doc_vals(owner: &str, body: &str) -> Vec<(String, Value)> {
+        vec![
+            ("id".to_string(), Value::Int64(1)),
+            ("owner".to_string(), Value::String(owner.into())),
+            ("body".to_string(), Value::String(body.into())),
+        ]
+    }
+
+    #[tokio::test]
+    async fn test_row_ownership_point_ops() {
+        let server = owned_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Alice creates her own doc.
+        let ins = client
+            .roundtrip(&authed_req(1, Op::Insert, "docs", "tok-alice", None, doc_vals("alice", "a")))
+            .await
+            .unwrap();
+        assert!(ins.ok, "own insert failed: {:?}", ins.error);
+        let gid = ins.rows[0].id;
+
+        // Bob can't read it (hidden as not-found), update it, or delete it.
+        let g = client.roundtrip(&authed_req(2, Op::Get, "docs", "tok-bob", Some(gid), vec![])).await.unwrap();
+        assert!(!g.ok && g.error.as_deref().unwrap_or("").contains("row not found"), "leak: {:?}", g);
+        let u = client
+            .roundtrip(&authed_req(3, Op::Update, "docs", "tok-bob", Some(gid), vec![("body".to_string(), Value::String("hijack".into()))]))
+            .await
+            .unwrap();
+        assert!(!u.ok && u.error.as_deref().unwrap_or("").contains("forbidden"), "got {:?}", u);
+        let d = client.roundtrip(&authed_req(4, Op::Delete, "docs", "tok-bob", Some(gid), vec![])).await.unwrap();
+        assert!(!d.ok, "bob deleted alice's row");
+
+        // Bob can't create docs FOR alice either (or without owner).
+        let f = client.roundtrip(&authed_req(5, Op::Insert, "docs", "tok-bob", None, doc_vals("alice", "forged"))).await.unwrap();
+        assert!(!f.ok && f.error.as_deref().unwrap_or("").contains("forbidden"), "got {:?}", f);
+        let n = client
+            .roundtrip(&authed_req(6, Op::Insert, "docs", "tok-bob", None, vec![("id".to_string(), Value::Int64(9))]))
+            .await
+            .unwrap();
+        assert!(!n.ok, "ownerless insert must fail");
+
+        // Alice reads/updates her own; admin bypasses everything.
+        let g = client.roundtrip(&authed_req(7, Op::Get, "docs", "tok-alice", Some(gid), vec![])).await.unwrap();
+        assert!(g.ok, "own get failed: {:?}", g.error);
+        let a = client.roundtrip(&authed_req(8, Op::Get, "docs", "tok-admin", Some(gid), vec![])).await.unwrap();
+        assert!(a.ok, "admin get failed: {:?}", a.error);
+
+        // Collection reads fail closed on row-owner tables.
+        let s = client
+            .roundtrip(&authed_req(9, Op::Scan, "docs", "tok-alice", None, vec![("_limit".to_string(), Value::Int64(10))]))
+            .await
+            .unwrap();
+        assert!(!s.ok && s.error.as_deref().unwrap_or("").contains("disabled"), "got {:?}", s);
+        let f2 = client
+            .roundtrip(&authed_req(10, Op::Find, "docs", "tok-alice", None, vec![
+                ("_col".to_string(), Value::String("owner".into())),
+                ("_val".to_string(), Value::String("alice".into())),
+            ]))
+            .await
+            .unwrap();
+        assert!(!f2.ok, "find must fail closed: {:?}", f2);
+    }
+
+    #[tokio::test]
+    async fn test_session_expiry_enforced() {
+        let server = owned_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Live session authenticates.
+        let p = client.roundtrip(&authed_req(1, Op::Ping, "", "sess-alice", None, vec![])).await.unwrap();
+        assert!(p.ok, "live session rejected: {:?}", p.error);
+        // Expired session (ttl 0) is evicted on sight → unauthorized.
+        // Fresh connection: connection identity is sticky, so a failed
+        // handshake must not inherit a prior auth.
+        let mut client2 = Client::connect(addr).await.unwrap();
+        let ins = client2
+            .roundtrip(&authed_req(2, Op::Insert, "docs", "sess-dead", None, doc_vals("alice", "x")))
+            .await
+            .unwrap();
+        assert!(!ins.ok && ins.error.as_deref().unwrap_or("").contains("unauthorized"), "got {:?}", ins);
+        // Bogus token likewise (fresh connection).
+        let mut client3 = Client::connect(addr).await.unwrap();
+        let ins2 = client3
+            .roundtrip(&authed_req(3, Op::Insert, "docs", "bogus", None, doc_vals("alice", "x")))
+            .await
+            .unwrap();
+        assert!(!ins2.ok, "bogus token accepted");
+    }
+
+    #[tokio::test]
+    async fn test_row_ownership_atomic_batch() {
+        let server = owned_server();
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Bob's batch sneaks one forged insert among two legal ones:
+        // the whole frame must abort, nothing applied.
+        let mk = |id: u64, owner: &str| {
+            let mut all = vec![("_auth".to_string(), Value::String("tok-bob".into()))];
+            all.extend(doc_vals(owner, "b"));
+            let map: std::collections::HashMap<String, Value> = all.into_iter().collect();
+            Request { id, op: Op::Insert, table: "docs".into(), row_id: None, values: Some(map) }
+        };
+        let b = roundtrip_batch(&mut client, 50, vec![mk(51, "bob"), mk(52, "alice"), mk(53, "bob")])
+            .await
+            .unwrap();
+        // NOTE: plain Batch is per-op (non-atomic by design): bob's two
+        // succeed, the forgery fails. Ownership is per-op, not per-frame.
+        assert!(b.results[0].ok && !b.results[1].ok && b.results[2].ok, "got {:?}", b.results);
+
+        // Atomic batch with the same mix aborts EVERYTHING (all-or-nothing).
+        let b = roundtrip_atomic(&mut client, 60, vec![mk(61, "bob"), mk(62, "alice"), mk(63, "bob")])
+            .await
+            .unwrap();
+        assert!(b.results.iter().all(|r| !r.ok), "atomic must abort all: {:?}", b.results);
+        assert_eq!(server.engine().count("docs").unwrap(), 2, "only bob's two plain-batch rows");
     }
 
     #[tokio::test]

@@ -30,6 +30,10 @@ Routing (`table_shards`, empty = unsharded): insert hashes shard-key % N
   (FNV-1a) → `{base}_{NN}` physicals; point ops route by RowId high bits;
   Scan/Find fan out + merge with global ids; change-log stays on base names;
   WAL carries global ids (replay strips to local per physical).
+Auth: short-lived sessions (expiry enforced) + long-lived identities;
+  `row_owner` tables enforce per-row subjects on point ops (single/atomic/
+  procedure), hide foreign reads as not-found, and reject collection reads
+  fail-closed. Single fast paths (Get/Scan) enforce the same rules.
   ▼
 Engine: DashMap table map → per-table RwLock → HashMap rows + per-col unique maps
   ▼

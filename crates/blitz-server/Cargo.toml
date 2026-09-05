@@ -31,6 +31,7 @@ anyhow = { workspace = true }
 bytes = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+uuid = { workspace = true }
 socket2 = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

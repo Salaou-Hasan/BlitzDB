@@ -103,6 +103,21 @@ The server runs the registered procedure's steps in one OCC transaction
   over-TCP deploy/versioning is future work. Strict `Int64`/`UInt64` columns
   (no coercion): pass IDs in the column's own type.
 
+## Auth sessions + row ownership
+
+- Sessions: `register_session(token, identity, ttl_secs)` mints short-lived
+  bearers (expiry enforced + evicted on resolve); pre-shared/registered
+  identities stay long-lived. A failed handshake never de-authenticates a
+  connection (identity is sticky; only a successful `_auth` switches it).
+- `row_owner: {table: column}`: point ops are owner-checked (insert values /
+  stored row must equal the caller's subject; admin role bypasses). Reads of
+  others' rows hide as `row not found` (no existence oracle); writes deny
+  with `forbidden`. Applies to single ops, atomic batches, and procedure
+  steps alike.
+- Collection reads (`Scan`/`Find`/`Subscribe`/`Search`/push streams) on
+  row-owner tables fail closed — use point reads. (Query-time filtering is
+  future work; v1 refuses to silently drop rows.)
+
 ## Errors (typed strings for SDK mapping)
 
 - `unauthorized: authentication required` → handshake first, then retry.

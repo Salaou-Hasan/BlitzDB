@@ -1,5 +1,5 @@
 use anyhow::Result;
-use blitz_auth::{Identity, Permission};
+use blitz_auth::{Identity, Permission, Session};
 use blitz_core::{InMemoryTableEngine, TableEngine};
 use blitz_events::{Event, EventEmitter, EventKind};
 use blitz_policy::PolicyEngine;
@@ -83,6 +83,13 @@ pub struct ServerConfig {
     /// indexes are per-shard (global uniqueness needs the shard key to be
     /// the unique column, or unsharded tables).
     pub table_shards: HashMap<String, ShardSpec>,
+    /// Row ownership: `table -> owner column`. When set, point ops are
+    /// owner-checked (insert values / stored row must equal the caller's
+    /// subject, or admin role); collection reads (Scan/Find/Subscribe/Search)
+    /// on the table are rejected fail-closed (v1: no silent row-dropping —
+    /// pagination/counts would lie; query-time filtering is future work).
+    /// Empty (default) = table-level auth only.
+    pub row_owner: HashMap<String, String>,
 }
 
 impl Default for ServerConfig {
@@ -104,6 +111,7 @@ impl Default for ServerConfig {
             require_auth: false,
             auth_tokens: HashMap::new(),
             table_shards: HashMap::new(),
+            row_owner: HashMap::new(),
         }
     }
 }
@@ -208,6 +216,11 @@ pub struct BlitzServer {
     subscription_manager: RwLock<SubscriptionManager>,
     policy_engine: PolicyEngine,
     identities: RwLock<HashMap<String, Identity>>,
+    /// Short-lived sessions: token → Session (expiry enforced on resolve;
+    /// expired entries are evicted opportunistically). Pre-shared
+    /// `auth_tokens`/`identities` stay long-lived by design; sessions are
+    /// for login flows (`register_session` with TTL).
+    sessions: RwLock<HashMap<String, Session>>,
     connections: AtomicUsize,
     started_at: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     total_requests: std::sync::atomic::AtomicU64,
@@ -269,6 +282,7 @@ impl BlitzServer {
             subscription_manager: RwLock::new(SubscriptionManager::new()),
             policy_engine: PolicyEngine::new(),
             identities: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
             connections: AtomicUsize::new(0),
             started_at: RwLock::new(None),
             total_requests: std::sync::atomic::AtomicU64::new(0),
@@ -687,11 +701,35 @@ impl BlitzServer {
         }
     }
 
-    /// Resolve a bearer token to an identity (pre-shared config tokens +
-    /// runtime `register_identity` map). One HashMap lookup per connection
-    /// handshake — far under the 1ms auth/policy budget.
+    /// Resolve a bearer token to an identity. Short-lived sessions first
+    /// (expiry enforced; expired entries evicted on encounter), then the
+    /// long-lived pre-shared / registered identities. One map lookup per
+    /// connection handshake — far under the 1ms auth/policy budget.
     pub fn resolve_token(&self, token: &str) -> Option<Identity> {
+        if let Ok(mut s) = self.sessions.write() {
+            if let Some(sess) = s.get(token) {
+                if sess.is_expired() {
+                    s.remove(token);
+                } else {
+                    return Some(sess.identity.clone());
+                }
+            }
+        }
         self.identities.read().ok().and_then(|g| g.get(token).cloned())
+    }
+
+    /// Create a short-lived session token (`ttl_secs` from now). Returns the
+    /// token to hand to the client (bearer for `_auth` handshakes).
+    pub fn register_session(&self, token: String, identity: Identity, ttl_secs: u64) {
+        let sess = Session {
+            id: uuid::Uuid::new_v4(),
+            identity,
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::seconds(ttl_secs as i64),
+        };
+        if let Ok(mut s) = self.sessions.write() {
+            s.insert(token, sess);
+        }
     }
 
     /// Authorize one op for an (optionally authenticated) connection.
@@ -725,6 +763,40 @@ impl BlitzServer {
         match self.policy_engine.check(id, table, &perm) {
             Ok(true) => Ok(()),
             _ => Err("forbidden: policy denies"),
+        }
+    }
+
+    /// Owner column for a table, if row-level ownership is configured.
+    pub fn owner_column(&self, table: &str) -> Option<String> {
+        self.config.row_owner.get(table).cloned()
+    }
+
+    /// Row-level check after table-level [`authorize`] passes. No-op when
+    /// the table has no owner column, when auth is bypassed, or for admin
+    /// role holders. Otherwise the row's owner value must be the string
+    /// subject of the caller. `Ping`/`Call(fn:*)` never reach here with a
+    /// row context (Call steps check per touched table instead).
+    pub fn authorize_row(
+        &self,
+        ident: &Option<Identity>,
+        op: Op,
+        table: &str,
+        owner: Option<&Value>,
+    ) -> Result<(), &'static str> {
+        self.authorize(ident, op, table)?;
+        if !self.config.require_auth {
+            return Ok(());
+        }
+        if !self.config.row_owner.contains_key(table) {
+            return Ok(());
+        }
+        let id = ident.as_ref().ok_or("unauthorized: authentication required")?;
+        if id.has_role("admin") {
+            return Ok(());
+        }
+        match owner {
+            Some(Value::String(s)) if s == &id.subject => Ok(()),
+            _ => Err("forbidden: row owner mismatch"),
         }
     }
 
