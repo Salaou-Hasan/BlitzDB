@@ -41,6 +41,11 @@ frame = one read + one write. Per-op ok/err independent (partial failure
 normal, never atomic). Per-op latency ≈ `batch_time / N` (throughput exact).
 Recommended N = 25.
 
+The Rust SDK (`blitz-client`) makes this invisible: per-op awaits drain
+into shared frames automatically (singles go as singles, bursts as
+batches). Share `Client` handles across tasks (pool ≈ CCU/150) — one
+client per task can't batch awaited ops and pays a task-hop each.
+
 ## Sharding (server-side, stable names)
 
 App code always uses BASE table names (`posts`, never `posts_03`). When the

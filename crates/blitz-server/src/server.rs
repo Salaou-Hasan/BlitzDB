@@ -135,6 +135,20 @@ impl ShardSpec {
 pub const SHARD_SHIFT: u32 = 56;
 pub const LOCAL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
 
+/// Idempotency map shards (see `BlitzServer::idem`).
+pub const IDEM_SHARDS: usize = 16;
+const IDEM_SHARD_MASK: usize = IDEM_SHARDS - 1;
+
+/// FNV-1a shard for an idempotency key (fast, deterministic).
+fn idem_shard(key: &str) -> usize {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in key.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    (h as usize) & IDEM_SHARD_MASK
+}
+
 /// Deterministic FNV-1a hash over a value's canonical bytes (insert routing
 /// must be stable across processes/restarts — `RandomState` is not).
 fn shard_hash(v: &Value) -> u64 {
@@ -236,8 +250,10 @@ pub struct BlitzServer {
     /// ~30% throughput at 50K batch once shards landed).
     wal_enabled: AtomicBool,
     /// Idempotency dedup: client `_idem` key → assigned RowId.
-    /// Bounded (256K, clears half when full); safe-retry for shed/timeout.
-    idem: RwLock<HashMap<String, u64>>,
+    /// 16 shards by key hash (one global write lock collapsed past ~1K
+    /// concurrent inserters; sharded maps divide it by 16). Bounded 256K
+    /// total (each shard clears half past 16K); safe-retry for shed/timeout.
+    idem: [RwLock<HashMap<String, u64>>; IDEM_SHARDS],
     /// Live connections per source IP for per-IP caps.
     ips: std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
     /// Bounded recent-write log per table for `Subscribe` polls.
@@ -294,7 +310,7 @@ impl BlitzServer {
             wal: RwLock::new(None),
             wal_rotating: AtomicBool::new(false),
             wal_enabled: AtomicBool::new(false),
-            idem: RwLock::new(HashMap::new()),
+            idem: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             ips: std::sync::Mutex::new(HashMap::new()),
             changes: RwLock::new(HashMap::new()),
             change_seq: std::sync::atomic::AtomicU64::new(1),
@@ -653,13 +669,15 @@ impl BlitzServer {
 
     /// Idempotency: lookup cached RowId for a client `_idem` key.
     pub fn idem_lookup(&self, key: &str) -> Option<u64> {
-        self.idem.read().ok().and_then(|g| g.get(key).copied())
+        self.idem[idem_shard(key)].read().ok().and_then(|g| g.get(key).copied())
     }
 
-    /// Record `_idem` key → RowId. Bounded at 256K (clears half when full).
+    /// Record `_idem` key → RowId. Bounded at 256K total (owning shard
+    /// clears half past 16K).
     pub fn idem_record(&self, key: String, row_id: u64) {
-        if let Ok(mut g) = self.idem.write() {
-            if g.len() >= 256_000 {
+        let shard = idem_shard(&key);
+        if let Ok(mut g) = self.idem[shard].write() {
+            if g.len() >= 16_000 {
                 let drop_n = g.len() / 2;
                 let keys: Vec<String> = g.keys().take(drop_n).cloned().collect();
                 for k in keys {

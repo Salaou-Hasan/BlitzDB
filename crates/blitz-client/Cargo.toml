@@ -17,4 +17,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 blitz-server = { path = "../blitz-server" }
 blitz-runtime = { path = "../blitz-runtime" }
+blitz-core = { path = "../blitz-core" }
+blitz-types = { path = "../blitz-types" }
 tokio = { workspace = true }

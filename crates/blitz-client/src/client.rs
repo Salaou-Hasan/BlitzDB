@@ -1,10 +1,12 @@
 //! Reference client: one TCP connection, invisible autobatching.
 //!
 //! The programming model never changes with scale: every method looks like a
-//! single op. Under the hood the worker flushes 25 buffered ops (or 2ms,
-//! whichever first) as one batch frame — the exact wire shape the SLOs are
-//! proven on. Single pending ops flush as SINGLE frames (Get/Scan fast
-//! paths stay hot); only real batches go wide.
+//! single op. Under the hood the worker drains everything already queued and
+//! flushes it as one frame — under load the drain IS the batch (callers queue
+//! while a flush is in flight); at low load a lone op flushes the moment the
+//! worker wakes (no timer tax). Single-op drains go as SINGLE frames (the
+//! Get/Scan fast paths stay hot); multi-op drains go as one batch — the exact
+//! wire shapes the SLOs are proven on.
 //!
 //! Retry contract (v1, honest): a flush that fails before any response byte
 //! is retried ONCE after reconnect iff every op is a read or an `_idem`
@@ -28,11 +30,20 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{map_server_error, SdkError, SdkResult};
 
-/// Ops buffered before this worker flushes one batch frame (SLO-proven N).
+/// Target batch width (SLO-proven N). The drain-driven worker usually
+/// exceeds this under load (frames chunk at MAX_FLUSH_OPS); the constant
+/// documents the proven shape, not a wait threshold — nothing waits for N.
 pub const BATCH_N: usize = 25;
-/// Max age of the oldest buffered op before a partial flush (low-load p50
-/// cost; still 10× inside the SLO budget at low CCU).
+/// Kept for API compatibility; the worker no longer waits (drain-driven).
+/// Scheduled for removal.
 pub const BATCH_MAX_WAIT: Duration = Duration::from_millis(2);
+/// Hard cap per flush frame (protocol bound; larger drains chunk).
+pub const MAX_FLUSH_OPS: usize = 4096;
+/// Target ops per batch frame. Drains bigger than this chunk into multiple
+/// frames: one giant frame minimizes syscalls but its tail ops wait behind
+/// the whole frame's server time (head-of-line). 64 keeps frames amortized
+/// (~64× fewer syscalls than singles) while bounding HoL wait.
+pub const FLUSH_CHUNK: usize = 64;
 /// Default per-call timeout (flush + server + read).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -65,6 +76,10 @@ pub struct Client {
     tx: mpsc::UnboundedSender<Cmd>,
     next_id: Arc<AtomicU64>,
     timeout: Duration,
+    /// `_idem` prefix (one UUID per client) + counter: unique keys without
+    /// a `getrandom` syscall per insert.
+    idem_prefix: String,
+    idem_next: Arc<AtomicU64>,
 }
 
 impl Client {
@@ -81,11 +96,21 @@ impl Client {
         stream.set_nodelay(true).map_err(|e| SdkError::Transport(e.to_string()))?;
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(worker_loop(addr, stream, rx, timeout));
-        Ok(Self { tx, next_id: Arc::new(AtomicU64::new(1)), timeout })
+        Ok(Self {
+            tx,
+            next_id: Arc::new(AtomicU64::new(1)),
+            timeout,
+            idem_prefix: uuid::Uuid::new_v4().to_string(),
+            idem_next: Arc::new(AtomicU64::new(1)),
+        })
     }
 
     fn alloc_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn alloc_idem(&self) -> String {
+        format!("{}-{}", self.idem_prefix, self.idem_next.fetch_add(1, Ordering::Relaxed))
     }
 
     async fn exec(&self, req: Request, retry_safe: bool) -> SdkResult<Response> {
@@ -139,7 +164,7 @@ impl Client {
 
     /// Insert with auto `_idem` (safe reconnect-replay inside the window).
     pub async fn insert(&self, table: &str, mut values: HashMap<String, Value>) -> SdkResult<Row> {
-        values.insert("_idem".to_string(), Value::String(uuid::Uuid::new_v4().to_string()));
+        values.insert("_idem".to_string(), Value::String(self.alloc_idem()));
         let req = Request { id: self.alloc_id(), op: Op::Insert, table: table.into(), row_id: None, values: Some(values) };
         let mut rows = self.ok_rows(self.exec(req, true).await?)?;
         rows.pop().ok_or_else(|| SdkError::Server("insert returned no rows".into()))
@@ -251,95 +276,116 @@ async fn worker_loop(
 ) {
     let codec = FrameCodec::with_default_limit();
     let mut buf = BytesMut::new();
-    let mut pending: Vec<Pending> = Vec::new();
-    let mut tick = tokio::time::interval(BATCH_MAX_WAIT);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // Drop the immediate first tick: an idle worker shouldn't flush empties.
-    tick.tick().await;
-
     let mut dead = false;
     loop {
-        tokio::select! {
-            cmd = rx.recv() => {
-                match cmd {
-                    Some(Cmd::Batch(p)) => {
-                        pending.push(p);
-                        if pending.len() >= BATCH_N {
-                            dead = flush(&codec, &mut stream, &mut buf, &mut pending, addr, timeout).await.is_err();
-                            if dead { fail_all(&mut pending, "connection lost during flush"); }
-                        }
-                    }
-                    Some(Cmd::Direct(p)) => {
-                        // Flush anything buffered first (order!), then the
-                        // direct frame alone.
-                        if !pending.is_empty() && !dead {
-                            dead = flush(&codec, &mut stream, &mut buf, &mut pending, addr, timeout).await.is_err();
-                            if dead { fail_all(&mut pending, "connection lost during flush"); }
-                        }
-                        if dead {
-                            let _ = p.reply.send(Err(SdkError::Transport("connection lost".into())));
-                        } else {
-                            // flush() always replies (ok or err); the vec is
-                            // drained either way.
-                            let mut single = vec![p];
-                            if flush(&codec, &mut stream, &mut buf, &mut single, addr, timeout).await.is_err() {
-                                dead = true;
-                            }
-                        }
-                    }
-                    None => {
-                        // All handles dropped: best-effort final flush, then exit.
-                        if !pending.is_empty() && !dead {
-                            let _ = flush(&codec, &mut stream, &mut buf, &mut pending, addr, timeout).await;
-                        }
-                        fail_all(&mut pending, "client closed");
-                        return;
-                    }
+        // Block for the first command (nothing to do when idle — no timer
+        // tax: a lone op flushes the moment the worker wakes).
+        let first = match rx.recv().await {
+            Some(c) => c,
+            None => return, // all handles dropped; every accepted op replied
+        };
+        if dead {
+            // Lazy re-establish before doing work.
+            match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(s)) => {
+                    stream = s;
+                    buf.clear();
+                    dead = false;
+                }
+                _ => {
+                    fail_cmd(first, "connection lost; reconnect failed");
+                    continue;
                 }
             }
-            _ = tick.tick() => {
-                if !pending.is_empty() && !dead {
-                    dead = flush(&codec, &mut stream, &mut buf, &mut pending, addr, timeout).await.is_err();
-                    if dead { fail_all(&mut pending, "connection lost during flush"); }
-                } else if dead {
-                    // Try to re-establish for future work (lazy).
-                    match TcpStream::connect(addr).await {
-                        Ok(s) => { stream = s; dead = false; }
-                        Err(_) => {}
+        }
+        // Drain everything already queued: under load this IS the batch
+        // (callers queue while a flush is in flight); at low load it's one
+        // op flushed immediately. No waiting, no 2ms anything.
+        let mut cmds: Vec<Cmd> = vec![first];
+        while cmds.len() < MAX_FLUSH_OPS {
+            match rx.try_recv() {
+                Ok(cmd) => cmds.push(cmd),
+                Err(_) => break,
+            }
+        }
+        // Segment in order: consecutive Batch cmds share one frame; Direct
+        // cmds (ping/auth probes) always fly alone. One socket, sequential
+        // flushes — order preserved by construction.
+        let mut it = cmds.into_iter().peekable();
+        loop {
+            let direct = match it.peek() {
+                None => break,
+                Some(Cmd::Direct(_)) => true,
+                Some(Cmd::Batch(_)) => false,
+            };
+            if direct {
+                let pending = match it.next() {
+                    Some(Cmd::Direct(p)) => vec![p],
+                    _ => unreachable!(),
+                };
+                if flush_pending(&codec, &mut stream, &mut buf, pending, addr, timeout).await.is_err() {
+                    dead = true;
+                    // Anything not yet flushed fails fast (flushed replied).
+                    for cmd in it {
+                        fail_cmd(cmd, "connection lost during flush");
                     }
+                    break;
+                }
+            } else {
+                let mut run = Vec::new();
+                while matches!(it.peek(), Some(Cmd::Batch(_))) && run.len() < FLUSH_CHUNK {
+                    match it.next() {
+                        Some(Cmd::Batch(p)) => run.push(p),
+                        _ => unreachable!(),
+                    }
+                }
+                if flush_pending(&codec, &mut stream, &mut buf, run, addr, timeout).await.is_err() {
+                    dead = true;
+                    for cmd in it {
+                        fail_cmd(cmd, "connection lost during flush");
+                    }
+                    break;
                 }
             }
         }
     }
 }
 
-fn fail_all(pending: &mut Vec<Pending>, msg: &str) {
-    for p in pending.drain(..) {
-        let _ = p.reply.send(Err(SdkError::Transport(msg.into())));
+fn fail_cmd(cmd: Cmd, msg: &str) {
+    match cmd {
+        Cmd::Batch(p) | Cmd::Direct(p) => {
+            let _ = p.reply.send(Err(SdkError::Transport(msg.into())));
+        }
     }
 }
 
-/// Flush all buffered ops as one frame (single-op → SINGLE frame for the
-/// Get/Scan fast paths; N>1 → one batch). Returns Err on transport failure;
-/// on failure with an all-retry-safe batch, reconnects + resends once.
-async fn flush(
+/// Flush one run as one frame (single-op → SINGLE frame for the Get/Scan
+/// fast paths; N>1 → one batch). Takes ownership: requests move (no clone),
+/// every pending gets exactly one reply. Returns Err on transport failure;
+/// on failure with an all-retry-safe run, reconnects + resends once.
+async fn flush_pending(
     codec: &FrameCodec,
     stream: &mut TcpStream,
     buf: &mut BytesMut,
-    pending: &mut Vec<Pending>,
+    batch: Vec<Pending>,
     addr: SocketAddr,
     timeout: Duration,
 ) -> Result<(), ()> {
-    let batch: Vec<Pending> = pending.drain(..).collect();
     if batch.is_empty() {
         return Ok(());
     }
     let retry_safe = batch.iter().all(|p| p.retry_safe);
-    let reqs: Vec<Request> = batch.iter().map(|p| p.req.clone()).collect();
+    // Move out: requests for the wire, (reply, flag) kept aside.
+    let mut reqs: Vec<Request> = Vec::with_capacity(batch.len());
+    let mut repliers: Vec<(oneshot::Sender<SdkResult<Response>>, bool)> = Vec::with_capacity(batch.len());
+    for p in batch {
+        reqs.push(p.req);
+        repliers.push((p.reply, p.retry_safe));
+    }
     match flush_once(codec, stream, buf, &reqs, timeout).await {
         Ok(resps) => {
-            for (p, r) in batch.into_iter().zip(resps.into_iter()) {
-                let _ = p.reply.send(r);
+            for ((reply, _), r) in repliers.into_iter().zip(resps.into_iter()) {
+                let _ = reply.send(r);
             }
             Ok(())
         }
@@ -348,8 +394,8 @@ async fn flush(
             let mut fresh = match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
                 Ok(Ok(s)) => s,
                 _ => {
-                    for p in batch {
-                        let _ = p.reply.send(Err(SdkError::Transport("flush failed; reconnect failed".into())));
+                    for (reply, _) in repliers {
+                        let _ = reply.send(Err(SdkError::Transport("flush failed; reconnect failed".into())));
                     }
                     return Err(());
                 }
@@ -357,24 +403,24 @@ async fn flush(
             let mut fresh_buf = BytesMut::new();
             match flush_once(codec, &mut fresh, &mut fresh_buf, &reqs, timeout).await {
                 Ok(resps) => {
-                    for (p, r) in batch.into_iter().zip(resps.into_iter()) {
-                        let _ = p.reply.send(r);
+                    for ((reply, _), r) in repliers.into_iter().zip(resps.into_iter()) {
+                        let _ = reply.send(r);
                     }
                     *stream = fresh;
                     *buf = fresh_buf;
                     Ok(())
                 }
                 Err(_) => {
-                    for p in batch {
-                        let _ = p.reply.send(Err(SdkError::Transport("flush failed after reconnect".into())));
+                    for (reply, _) in repliers {
+                        let _ = reply.send(Err(SdkError::Transport("flush failed after reconnect".into())));
                     }
                     Err(())
                 }
             }
         }
         Err(_) => {
-            for p in batch {
-                let _ = p.reply.send(Err(SdkError::Transport("flush failed (not retry-safe; retry manually)".into())));
+            for (reply, _) in repliers {
+                let _ = reply.send(Err(SdkError::Transport("flush failed (not retry-safe; retry manually)".into())));
             }
             Err(())
         }
