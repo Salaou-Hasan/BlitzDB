@@ -1,0 +1,20 @@
+[package]
+name = "blitz-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Reference Rust SDK for BlitzDB: invisible autobatching, auto-idempotency, typed errors"
+
+[dependencies]
+blitz-protocol = { path = "../blitz-protocol" }
+blitz-types = { path = "../blitz-types" }
+tokio = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+blitz-server = { path = "../blitz-server" }
+blitz-runtime = { path = "../blitz-runtime" }
+tokio = { workspace = true }

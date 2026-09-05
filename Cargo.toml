@@ -24,6 +24,7 @@ members = [
     "crates/blitz-cluster",
     "crates/blitz-observability",
     "crates/blitz-cli",
+    "crates/blitz-client",
     "crates/blitz-server",
 ]
 

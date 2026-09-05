@@ -51,6 +51,11 @@ the wire): 1.96M/s, p50 2.3ms, p99 4.2ms, 0 errors, PASS — indistinguishable
 from client-mangled sharding (2.03M/s, p99 3.9ms). The model no longer
 changes with scale.
 
+Rust SDK (`blitz-client`, autobatch 25 / 2ms, per-op await style):
+1K clients × 20 mixed insert/get through the batcher: 43K/s, p50 7.1ms,
+p99 15.3ms, 0 errors, PASS. Per-op latency carries the ≤2ms batching delay
+by design — same SLO contract, same verdict.
+
 ## Reading results honestly
 
 - Bands, not points: this box varies ±40% run-to-run; first level often
