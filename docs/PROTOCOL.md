@@ -125,6 +125,26 @@ Submit a module once, poll for completion — guests never run inline:
   can't roll back). HTTP bridge: `job_submit` / `job_poll` op names,
   module bytes via `{"$bytes": "<base64>"}`.
 
+## Dynamic procedures (`Op::ProcDeploy` 12, `ProcList` 13, `ProcDrop` 14)
+
+Deploy validated procedures over TCP; calls always run the latest version:
+
+- `ProcDeploy`: `table: "fn:<name>"` (must match the envelope), `values`
+  `{v: 1, procedure: Json{...}}`. Names `[A-Za-z0-9_:./-]` ≤128 chars;
+  ≤256 steps; `If` nesting ≤16; `CallFunction` targets must exist;
+  tables need not exist yet (deploy-then-migrate is legitimate).
+  Same-name redeploys bump the server-assigned monotonic version.
+- Value literals are friendly-JSON (SDK-consistent): `null`, booleans,
+  numbers (i64-range → Int64, u64-only → UInt64, float → Float64),
+  strings (UUID-shaped → Uuid), arrays, `{"$i32"}`/`{"$u32"}`/`{"$i64"}`/
+  `{"$u64"}`/`{"$f32"}` (exact widths, never narrowed),
+  `{"$decimal"}`, `{"$date":"YYYY-MM-DD"}`, `{"$uuid"}`,
+  `{"$bytes":"<base64>"}`, `{"$ts":<micros>}`; other objects → Json.
+- Auth: `Custom("proc.deploy")` / `("proc.list")` / `("proc.drop")` on the
+  `fn:<name>` resource (list/drop-all use `table: ""` / the name).
+  Rejected inside atomic batches (registry mutation can't roll back).
+  HTTP bridge: `proc_deploy` / `proc_list` / `proc_drop`.
+
 ## Auth sessions + row ownership
 
 - Sessions: `register_session(token, identity, ttl_secs)` mints short-lived

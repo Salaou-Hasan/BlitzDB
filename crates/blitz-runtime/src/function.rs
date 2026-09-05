@@ -36,7 +36,9 @@ impl AppFunction for FnFunction {
 }
 
 /// A stored procedure is a named sequence of steps.
-#[derive(Debug, Clone)]
+/// Serializable (deploy envelope carries this shape as JSON; see
+/// `validate_procedure` for deploy-time rules).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Procedure {
     pub name: String,
     pub description: String,
@@ -48,7 +50,7 @@ pub struct Procedure {
 /// `$var` references in any `Value::String` resolve against live variables
 /// (same convention as `CallFunction` args). DB steps run inside the
 /// caller's transaction via [`ProcedureBackend`](crate::ProcedureBackend).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ProcedureStep {
     /// Call a function by name with arguments.
     CallFunction {
@@ -105,7 +107,7 @@ pub enum ProcedureStep {
 }
 
 /// A condition that can be evaluated.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum Condition {
     /// Variable equals a value.
     Equals(String, Value),

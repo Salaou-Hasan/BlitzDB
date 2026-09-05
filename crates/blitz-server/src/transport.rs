@@ -690,6 +690,77 @@ pub(crate) fn dispatch(server: &std::sync::Arc<BlitzServer>, authed: &Option<bli
                 None => Response::err(id, format!("job not found: {}", job_id)),
             }
         }
+        Op::ProcDeploy => {
+            let name = match req.table.strip_prefix("fn:") {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ => return Response::err(id, "proc_deploy requires table `fn:<procedure>`"),
+            };
+            let values = match req.values {
+                Some(v) => v,
+                None => return Response::err(id, "proc_deploy requires values {v, procedure}"),
+            };
+            let version = match values.get("v") {
+                Some(Value::Int64(1)) => Some(1u64),
+                Some(Value::UInt64(1)) => Some(1u64),
+                other => {
+                    return Response::err(id, format!("unsupported envelope version (want 1): {:?}", other))
+                }
+            };
+            let proc_json = match values.get("procedure") {
+                Some(Value::Json(j)) => j.clone(),
+                _ => return Response::err(id, "proc_deploy requires values.procedure as JSON object"),
+            };
+            let functions = match server.functions().read() {
+                Ok(g) => g,
+                Err(e) => return Response::err(id, format!("function registry locked: {}", e)),
+            };
+            let proc = match blitz_runtime::deploy_from_parsed(version, &proc_json, &functions) {
+                Ok(p) => p,
+                Err(e) => return Response::err(id, format!("invalid procedure: {}", e)),
+            };
+            drop(functions);
+            if proc.name != name {
+                return Response::err(
+                    id,
+                    format!("envelope procedure {:?} must match table fn:<name>", proc.name),
+                );
+            }
+            match server.deploy_procedure(proc) {
+                Ok(version) => {
+                    let mut out = std::collections::HashMap::new();
+                    out.insert("name".to_string(), Value::String(name));
+                    out.insert("version".to_string(), Value::UInt64(version));
+                    Response::ok(id, vec![RowView { id: 0, values: out }])
+                }
+                Err(e) => Response::err(id, format!("invalid procedure: {}", e)),
+            }
+        }
+        Op::ProcList => {
+            let rows = server
+                .list_procedures()
+                .into_iter()
+                .map(|(name, description, version, steps)| {
+                    let mut values = std::collections::HashMap::new();
+                    values.insert("name".to_string(), Value::String(name));
+                    values.insert("description".to_string(), Value::String(description));
+                    values.insert("version".to_string(), Value::UInt64(version));
+                    values.insert("steps".to_string(), Value::UInt64(steps as u64));
+                    RowView { id: 0, values }
+                })
+                .collect();
+            Response::ok(id, rows)
+        }
+        Op::ProcDrop => {
+            let name = match req.table.strip_prefix("fn:") {
+                Some(n) if !n.is_empty() => n,
+                _ => return Response::err(id, "proc_drop requires table `fn:<procedure>`"),
+            };
+            if server.drop_procedure(name) {
+                Response::ok(id, Vec::new())
+            } else {
+                Response::err(id, format!("procedure not found: {}", name))
+            }
+        }
     }
 }
 
@@ -757,7 +828,7 @@ pub(crate) fn execute_atomic(
         // Snapshot ops would read outside tx versioning, nested Calls
         // would nest transactions, and job ops spawn background work that
         // can't roll back: reject, don't fake.
-        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll) {
+        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop) {
             return abort_all(format!(
                 "atomic batch aborted: {:?} not supported in atomic batch",
                 op.op
@@ -944,7 +1015,7 @@ pub(crate) fn execute_atomic(
                 let (shard, _) = BlitzServer::split_id(global);
                 buffered.push((rid, Buffered::Delete { base: op.table, physical, shard, local: local_id, global }));
             }
-            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll => {
+            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop => {
                 return fail(&mut tx, rid, format!("{:?} not supported in atomic batch", op.op))
             }
         }
@@ -4324,6 +4395,135 @@ mod tests {
         .await
         .unwrap();
         assert!(b.results.iter().all(|x| !x.ok), "nested job must abort: {:?}", b.results);
+    }
+
+    /// Deploy envelope for a balance-gated transfer (friendly JSON values).
+    fn transfer_envelope(desc: &str) -> serde_json::Value {
+        serde_json::json!({"v": 1, "procedure": {
+            "name": "transfer", "description": desc,
+            "steps": [
+                {"Read": {"table": "accounts", "id": "$account_id", "into": "a"}},
+                {"If": {
+                    "condition": {"GreaterOrEqual": ["a.balance", "$price"]},
+                    "then_steps": [
+                        {"Insert": {"table": "orders", "values": {
+                            "id": 7, "account_id": "$account_id", "amount": "$price"}, "into": "order_id"}},
+                        {"Update": {"table": "accounts", "id": "$account_id",
+                            "values": {"status": "charged"}}},
+                        {"Return": {"value": "$order_id"}}
+                    ],
+                    "else_steps": [{"Fail": {"message": "insufficient balance"}}]
+                }}
+            ]
+        }})
+    }
+
+    fn deploy_req(id: u64, envelope: serde_json::Value) -> Request {
+        let mut values = std::collections::HashMap::new();
+        values.insert("v".to_string(), Value::Int64(1));
+        values.insert("procedure".to_string(), Value::Json(envelope["procedure"].clone()));
+        Request { id, op: Op::ProcDeploy, table: "fn:transfer".into(), row_id: None, values: Some(values) }
+    }
+
+    #[tokio::test]
+    async fn test_proc_deploy_call_redeploy_drop() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        server.engine().create_table(accounts_schema()).unwrap();
+        server.engine().create_table(orders_schema()).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Deploy v1 over TCP.
+        let r = client.roundtrip(&deploy_req(1, transfer_envelope("first"))).await.unwrap();
+        assert!(r.ok, "deploy failed: {:?}", r.error);
+        assert_eq!(r.rows[0].values.get("version"), Some(&Value::UInt64(1)));
+        // List shows it.
+        let r = client.roundtrip(&Request { id: 2, op: Op::ProcList, table: "".into(), row_id: None, values: None }).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        assert_eq!(r.rows[0].values.get("name"), Some(&Value::String("transfer".into())));
+        // Seed + call the DEPLOYED procedure (real end-to-end).
+        let seed = client.roundtrip(&Request {
+            id: 3, op: Op::Insert, table: "accounts".into(), row_id: None,
+            values: Some(values(&[
+                ("id", Value::Int64(1)),
+                ("balance", Value::Int64(100)),
+                ("status", Value::String("active".into())),
+            ])),
+        }).await.unwrap();
+        assert!(seed.ok);
+        let acct = seed.rows[0].id;
+        let r = client.roundtrip(&call_req(4, "transfer", vec![
+            ("account_id", Value::Int64(acct as i64)),
+            ("price", Value::Int64(40)),
+        ])).await.unwrap();
+        assert!(r.ok, "call failed: {:?}", r.error);
+        assert_eq!(r.rows[0].values.get("_applied").map(|v| match v {
+            Value::Json(serde_json::Value::Array(a)) => a.len(),
+            _ => 0,
+        }), Some(2));
+        // Redeploy bumps the version.
+        let r = client.roundtrip(&deploy_req(5, transfer_envelope("second"))).await.unwrap();
+        assert!(r.ok, "redeploy failed: {:?}", r.error);
+        assert_eq!(r.rows[0].values.get("version"), Some(&Value::UInt64(2)));
+        // Drop: calls fail, list empties.
+        let r = client.roundtrip(&Request { id: 6, op: Op::ProcDrop, table: "fn:transfer".into(), row_id: None, values: None }).await.unwrap();
+        assert!(r.ok, "drop failed: {:?}", r.error);
+        let r = client.roundtrip(&call_req(7, "transfer", vec![])).await.unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("not found"), "got {:?}", r);
+        let r = client.roundtrip(&Request { id: 8, op: Op::ProcList, table: "".into(), row_id: None, values: None }).await.unwrap();
+        assert!(r.ok && r.rows.is_empty(), "got {:?}", r);
+        let r = client.roundtrip(&Request { id: 9, op: Op::ProcDrop, table: "fn:transfer".into(), row_id: None, values: None }).await.unwrap();
+        assert!(!r.ok, "double drop must err");
+    }
+
+    #[tokio::test]
+    async fn test_proc_deploy_validation_and_atomic() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Unknown function reference rejected.
+        let mut bad = transfer_envelope("bad");
+        bad["procedure"]["steps"] = serde_json::json!([
+            {"CallFunction": {"function": "nope", "args": {}}}
+        ]);
+        let r = client.roundtrip(&deploy_req(1, bad)).await.unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("unknown function"), "got {:?}", r);
+        // Envelope/table name mismatch rejected.
+        let r = client.roundtrip(&Request {
+            id: 2, op: Op::ProcDeploy, table: "fn:other".into(), row_id: None,
+            values: Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("v".to_string(), Value::Int64(1));
+                m.insert("procedure".to_string(), Value::Json(transfer_envelope("x")["procedure"].clone()));
+                m
+            }),
+        }).await.unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("must match"), "got {:?}", r);
+        // Bad envelope version rejected.
+        let r = client.roundtrip(&Request {
+            id: 3, op: Op::ProcDeploy, table: "fn:transfer".into(), row_id: None,
+            values: Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("v".to_string(), Value::Int64(99));
+                m.insert("procedure".to_string(), Value::Json(transfer_envelope("x")["procedure"].clone()));
+                m
+            }),
+        }).await.unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("version"), "got {:?}", r);
+        // Deploy ops inside atomic batches abort (registry can't roll back).
+        let b = roundtrip_atomic(&mut client, 50, vec![Request {
+            id: 51, op: Op::ProcList, table: "".into(), row_id: None, values: None,
+        }])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|x| !x.ok), "registry op must abort atomic: {:?}", b.results);
     }
 
     #[tokio::test]

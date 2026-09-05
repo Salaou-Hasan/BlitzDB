@@ -42,6 +42,16 @@ pub enum Op {
     /// Poll a submitted job: `values {_job: String id}` → `{job_id,
     /// status, result?, error?}`. Missing jobs err (bounded retention).
     JobPoll,
+    /// Deploy a procedure: `table` is `fn:<name>` (must match the envelope's
+    /// procedure name), `values` is the deploy envelope
+    /// `{"v":1,"procedure":{...}}`. Validated; same-name redeploys bump the
+    /// server-assigned monotonic version. Needs `proc.deploy` rights.
+    ProcDeploy,
+    /// List procedures: `values` ignored → one row per procedure
+    /// `{name, description, version, steps}`. Needs `proc.list` rights.
+    ProcList,
+    /// Drop a procedure: `table` is `fn:<name>`. Needs `proc.drop` rights.
+    ProcDrop,
 }
 
 impl Op {
@@ -59,6 +69,9 @@ impl Op {
             Op::Call => 9,
             Op::JobSubmit => 10,
             Op::JobPoll => 11,
+            Op::ProcDeploy => 12,
+            Op::ProcList => 13,
+            Op::ProcDrop => 14,
         }
     }
 
@@ -76,6 +89,9 @@ impl Op {
             9 => Some(Op::Call),
             10 => Some(Op::JobSubmit),
             11 => Some(Op::JobPoll),
+            12 => Some(Op::ProcDeploy),
+            13 => Some(Op::ProcList),
+            14 => Some(Op::ProcDrop),
             _ => None,
         }
     }
@@ -182,11 +198,14 @@ mod tests {
             (Op::Call, 9),
             (Op::JobSubmit, 10),
             (Op::JobPoll, 11),
+            (Op::ProcDeploy, 12),
+            (Op::ProcList, 13),
+            (Op::ProcDrop, 14),
         ] {
             assert_eq!(op.tag(), tag);
             assert_eq!(Op::from_tag(tag), Some(op));
         }
-        assert_eq!(Op::from_tag(12), None);
+        assert_eq!(Op::from_tag(15), None);
         assert_eq!(Op::from_tag(255), None);
     }
 

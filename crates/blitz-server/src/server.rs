@@ -276,9 +276,9 @@ pub struct BlitzServer {
     fanout_done: std::sync::atomic::AtomicU64,
     fanout_dropped: std::sync::atomic::AtomicU64,
     /// Named server-side procedures (`Op::Call` executes these
-    /// transactionally). Registered in-process at startup/embedding;
-    /// dynamic over-TCP registration is future work (documented).
-    procedures: RwLock<HashMap<String, blitz_runtime::Procedure>>,
+    /// transactionally). Versioned per name (monotonic u64, server-assigned
+    /// on deploy); `register_procedure` deploys at version 1/first-write.
+    procedures: RwLock<HashMap<String, RegisteredProcedure>>,
     /// Pure-compute functions callable from procedure steps (builtins
     /// registered at startup; embedders can add more).
     functions: RwLock<blitz_runtime::FunctionRegistry>,
@@ -295,6 +295,14 @@ pub struct StoredWasmJob {
     pub job: blitz_jobs::Job,
     pub wasm: Vec<u8>,
     pub input: String,
+}
+
+/// A deployed procedure with its server-assigned monotonic version.
+/// Redeploys bump the version; calls always run the latest.
+#[derive(Clone, Debug)]
+pub struct RegisteredProcedure {
+    pub proc: blitz_runtime::Procedure,
+    pub version: u64,
 }
 
 /// Max retained jobs (terminal-first eviction past this).
@@ -455,17 +463,54 @@ impl BlitzServer {
         (self.physical_table(base, shard % n), local)
     }
 
-    /// Register a server-side procedure for `Op::Call` (replaces same name).
-    /// In-process only in v1: embedders/tests register at startup.
-    pub fn register_procedure(&self, proc: blitz_runtime::Procedure) {
-        if let Ok(mut g) = self.procedures.write() {
-            g.insert(proc.name.clone(), proc);
-        }
+    /// Register a server-side procedure for `Op::Call` (version 1 on
+    /// first deploy, monotonic bump on redeploy). In-process path used by
+    /// embedders/tests; TCP deploy validates identically.
+    pub fn register_procedure(&self, proc: blitz_runtime::Procedure) -> u64 {
+        self.deploy_procedure(proc).unwrap_or(0)
     }
 
-    /// Fetch a registered procedure by name.
+    /// Validate + store a procedure, returning its assigned version.
+    /// Same-name redeploys bump (calls always run the latest).
+    pub fn deploy_procedure(&self, proc: blitz_runtime::Procedure) -> Result<u64, String> {
+        let functions = self.functions.read().map_err(|e| format!("function registry locked: {}", e))?;
+        blitz_runtime::validate_procedure(&proc, &functions)?;
+        drop(functions);
+        let mut procs = self.procedures.write().map_err(|e| format!("procedure registry locked: {}", e))?;
+        let version = procs.get(&proc.name).map(|r| r.version + 1).unwrap_or(1);
+        let name = proc.name.clone();
+        procs.insert(name, RegisteredProcedure { proc, version });
+        Ok(version)
+    }
+
+    /// Drop a deployed procedure. False when absent.
+    pub fn drop_procedure(&self, name: &str) -> bool {
+        self.procedures.write().ok().map(|mut g| g.remove(name).is_some()).unwrap_or(false)
+    }
+
+    /// Fetch a registered procedure by name (latest version).
     pub fn get_procedure(&self, name: &str) -> Option<blitz_runtime::Procedure> {
-        self.procedures.read().ok()?.get(name).cloned()
+        self.procedures.read().ok()?.get(name).map(|r| r.proc.clone())
+    }
+
+    /// List (name, description, version, step count), sorted by name.
+    pub fn list_procedures(&self) -> Vec<(String, String, u64, usize)> {
+        let mut out: Vec<(String, String, u64, usize)> = self
+            .procedures
+            .read()
+            .map(|g| {
+                g.iter()
+                    .map(|(n, r)| (n.clone(), r.proc.description.clone(), r.version, r.proc.steps.len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Borrow the function registry (deploy validation reads it).
+    pub fn functions(&self) -> &std::sync::RwLock<blitz_runtime::FunctionRegistry> {
+        &self.functions
     }
 
     /// Call a pure-compute function (procedure steps delegate here).
@@ -894,6 +939,9 @@ impl BlitzServer {
             Op::Call => Permission::Custom("call".to_string()),
             Op::JobSubmit => Permission::Custom("job.submit".to_string()),
             Op::JobPoll => Permission::Custom("job.poll".to_string()),
+            Op::ProcDeploy => Permission::Custom("proc.deploy".to_string()),
+            Op::ProcList => Permission::Custom("proc.list".to_string()),
+            Op::ProcDrop => Permission::Custom("proc.drop".to_string()),
             Op::Ping => return Ok(()),
         };
         let id = ident.as_ref().ok_or("unauthorized: authentication required")?;
