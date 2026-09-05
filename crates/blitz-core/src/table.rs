@@ -67,6 +67,15 @@ pub trait TableEngine: Send + Sync {
     /// List all table names (for snapshots / observability).
     fn table_names(&self) -> Vec<String>;
 
+    /// O(1) point lookup via a unique/PK column index. Errs when the column
+    /// is not unique-indexed (full scans stay out of the hot path by design).
+    fn lookup_by_unique(
+        &self,
+        table_name: &str,
+        column: &str,
+        value: &Value,
+    ) -> CoreResult<Option<Arc<Row>>>;
+
     /// Restore a row with its original ID (snapshot/WAL replay).
     /// Bumps `next_id` past the restored ID so later inserts don't collide.
     /// Fails if the ID already exists (replay must be idempotent-ordered).
@@ -351,6 +360,35 @@ impl TableEngine for InMemoryTableEngine {
 
     fn table_names(&self) -> Vec<String> {
         self.tables.iter().map(|r| r.key().clone()).collect()
+    }
+
+    fn lookup_by_unique(
+        &self,
+        table_name: &str,
+        column: &str,
+        value: &Value,
+    ) -> CoreResult<Option<Arc<Row>>> {
+        let table = self.table(table_name)?;
+        let table = table.read();
+        let is_uniq = table
+            .schema
+            .columns
+            .iter()
+            .any(|c| c.name == column && (c.primary_key || c.unique));
+        if !is_uniq {
+            return Err(CoreError::ConstraintViolation(format!(
+                "lookup_by_unique: '{}' is not unique-indexed (no full scans on hot path)",
+                column
+            )));
+        }
+        if value.is_null() {
+            return Ok(None);
+        }
+        let id = table.uniq.get(column).and_then(|idx| idx.get(value).copied());
+        match id {
+            Some(rid) => Ok(table.rows.get(&rid).cloned()),
+            None => Ok(None),
+        }
     }
 
     fn insert_preserving_id(&self, table_name: &str, row: Row) -> CoreResult<RowId> {

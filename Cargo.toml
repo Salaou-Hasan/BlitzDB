@@ -73,6 +73,12 @@ parking_lot = "0.12"
 socket2 = "0.6"
 dashmap = "5"
 
+# TLS (single-node prod edge; terminate at proxy if unused)
+# tokio-rustls 0.25 pairs with rustls 0.22 (its re-exported types must unify).
+rustls = { version = "=0.22.4", default-features = false, features = ["ring", "logging", "tls12"] }
+tokio-rustls = "0.25"
+rustls-pemfile = "2"
+
 # Macros
 paste = "1"
 

@@ -48,6 +48,18 @@ enum Commands {
         /// HTTP ops port for /metrics + /readyz (0 = disabled).
         #[arg(long, default_value_t = 0)]
         metrics_port: u16,
+
+        /// TLS cert PEM path (requires --tls-key; enables --tls-port).
+        #[arg(long)]
+        tls_cert: Option<String>,
+
+        /// TLS key PEM path (requires --tls-cert).
+        #[arg(long)]
+        tls_key: Option<String>,
+
+        /// TLS port for the BlitzDB binary protocol (0 = disabled).
+        #[arg(long, default_value_t = 0)]
+        tls_port: u16,
     },
 
     /// Show server version and build info
@@ -82,6 +94,14 @@ enum Commands {
         dir: String,
     },
 
+    /// Rotate WAL offline: recover into a snapshot and truncate WAL files.
+    /// Run with the server stopped. Bounds restart replay time.
+    Rotate {
+        /// Data directory holding wal_*.log + snapshots/
+        #[arg(short, long)]
+        dir: String,
+    },
+
     /// Show performance metrics
     Metrics,
 }
@@ -91,7 +111,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Serve { host, port, verbose, data_dir, durability, snapshot_secs, metrics_port } => {
+        Commands::Serve { host, port, verbose, data_dir, durability, snapshot_secs, metrics_port, tls_cert, tls_key, tls_port } => {
             let filter = if verbose { "debug" } else { "info" };
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
@@ -138,6 +158,22 @@ async fn main() -> Result<()> {
             if metrics_port > 0 {
                 println!("Ops HTTP on {}:{} (/metrics /readyz)", host, metrics_port);
             }
+            // Optional TLS listener alongside plaintext (same engine/auth).
+            // Handshake failures close without slot leaks; steady-state framing
+            // is identical, so only handshake RTT is added to p99.
+            let tls_acceptor = match (tls_cert, tls_key, tls_port) {
+                (Some(c), Some(k), p) if p > 0 => {
+                    Some((blitz_server::tls_acceptor_from_pem_files(&c, &k)?, p))
+                }
+                (None, None, 0) => None,
+                _ => {
+                    eprintln!("TLS needs --tls-cert + --tls-key + --tls-port together");
+                    std::process::exit(2);
+                }
+            };
+            if let Some((_, p)) = &tls_acceptor {
+                println!("TLS BlitzDB on {}:{}", host, p);
+            }
             println!("Press Ctrl+C to shutdown");
 
             // Periodic snapshots when durable (best-effort; logs errors).
@@ -157,6 +193,19 @@ async fn main() -> Result<()> {
             }
 
             let serve_fut = blitz_server::serve(std::sync::Arc::clone(&server), listener);
+            if let Some((acceptor, p)) = tls_acceptor {
+                let tls_sock = tokio::net::TcpSocket::new_v4()?;
+                tls_sock.set_recv_buffer_size(4096)?;
+                tls_sock.set_send_buffer_size(4096)?;
+                tls_sock.bind(format!("{}:{}", host, p).parse()?)?;
+                let tls_listener = tls_sock.listen(8192)?;
+                let tls_srv = std::sync::Arc::clone(&server);
+                tokio::spawn(async move {
+                    if let Err(e) = blitz_server::serve_tls(tls_srv, tls_listener, acceptor).await {
+                        tracing::warn!("tls serve ended: {:#}", e);
+                    }
+                });
+            }
             if metrics_port > 0 {
                 let ops_listener = tokio::net::TcpListener::bind(format!("{}:{}", host, metrics_port)).await?;
                 let ops_srv = std::sync::Arc::clone(&server);
@@ -220,6 +269,11 @@ async fn main() -> Result<()> {
             std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
             println!("Initialized BlitzDB in {}", dir);
             println!("Config written to {}", config_path.display());
+        }
+
+        Commands::Rotate { dir } => {
+            let snap = blitz_server::durability::offline_rotate(&dir)?;
+            println!("rotated: snapshot {}", snap.display());
         }
 
         Commands::Metrics => {

@@ -20,6 +20,7 @@ use blitz_core::TableEngine;
 use blitz_protocol::{BatchResponse, FrameCodec, Incoming, Op, Request, Response, RowView};
 use blitz_types::id::RowId;
 use blitz_types::row::Row;
+use blitz_types::value::Value;
 
 use crate::server::BlitzServer;
 
@@ -70,43 +71,107 @@ fn row_to_view(id: RowId, row: &Row) -> RowView {
     }
 }
 
+/// Extract + strip a connection handshake token (`values {"_auth": token}`).
+/// Returns the token when present and well-typed; always removes the key so
+/// validation/storage never see auth material.
+fn take_auth_token(values: &mut Option<std::collections::HashMap<String, Value>>) -> Option<String> {
+    values.as_mut()?.remove("_auth").and_then(|v| match v {
+        Value::String(s) => Some(s),
+        _ => None,
+    })
+}
+
 /// Default/max page sizes for `Scan`. Unbounded scans are the OOM killer:
 /// one slow client scanning a 1M-row table would pin a giant `Vec<Arc>`
 /// under read lock, then a giant response frame. Pagination bounds both.
 pub const DEFAULT_SCAN_LIMIT: usize = 1_000;
 pub const MAX_SCAN_LIMIT: usize = 10_000;
+pub const MAX_SUBSCRIBE_LIMIT: usize = 1_000;
 
-/// Parse `_limit` / `_offset` from Scan `values` without a protocol bump.
-/// Absent → (1000, 0). `_limit == 0` means "use default", clamped to
-/// `MAX_SCAN_LIMIT`. Negative / wrong-typed values fall back to defaults.
-fn scan_pagination(values: &Option<std::collections::HashMap<String, blitz_types::value::Value>>) -> (usize, usize) {
-    let mut limit = DEFAULT_SCAN_LIMIT;
-    let mut offset = 0usize;
+/// Parsed Scan window: limit/offset plus Twitter-style cursor paging.
+/// `_cursor` = last seen RowId (exclusive); `_order` = "asc"|"desc".
+/// Cursor filters via binary search on sorted ids (O(log N)); offset applies
+/// after the cursor so pages stay stable under concurrent inserts (offset
+/// alone drifts; cursor doesn't).
+struct ScanWindow {
+    limit: usize,
+    offset: usize,
+    desc: bool,
+    cursor: Option<u64>,
+}
+
+/// Parse `_limit` / `_offset` / `_order` / `_cursor` from Scan `values`
+/// without a protocol bump. Absent → (1000, 0, asc, none).
+fn scan_pagination(values: &Option<std::collections::HashMap<String, blitz_types::value::Value>>) -> ScanWindow {
+    use blitz_types::value::Value as V;
+    let mut w = ScanWindow { limit: DEFAULT_SCAN_LIMIT, offset: 0, desc: false, cursor: None };
+    let int_val = |v: &V| -> Option<usize> {
+        match v {
+            V::Int64(n) => Some((*n).max(0) as usize),
+            V::Int32(n) => Some((*n).max(0) as usize),
+            V::UInt64(n) => Some(*n as usize),
+            V::UInt32(n) => Some(*n as usize),
+            _ => None,
+        }
+    };
     if let Some(map) = values {
-        if let Some(v) = map.get("_limit") {
-            let asked = match v {
-                blitz_types::value::Value::Int64(n) => (*n).max(0) as usize,
-                blitz_types::value::Value::Int32(n) => (*n).max(0) as usize,
-                blitz_types::value::Value::UInt64(n) => *n as usize,
-                blitz_types::value::Value::UInt32(n) => *n as usize,
-                _ => DEFAULT_SCAN_LIMIT,
-            };
-            if asked > 0 {
-                limit = asked.min(MAX_SCAN_LIMIT);
+        if let Some(v) = map.get("_limit").and_then(int_val) {
+            if v > 0 {
+                w.limit = v.min(MAX_SCAN_LIMIT);
             }
         }
-        if let Some(v) = map.get("_offset") {
-            let asked = match v {
-                blitz_types::value::Value::Int64(n) => (*n).max(0) as usize,
-                blitz_types::value::Value::Int32(n) => (*n).max(0) as usize,
-                blitz_types::value::Value::UInt64(n) => *n as usize,
-                blitz_types::value::Value::UInt32(n) => *n as usize,
-                _ => 0,
-            };
-            offset = asked;
+        if let Some(v) = map.get("_offset").and_then(int_val) {
+            w.offset = v;
+        }
+        if let Some(V::String(s)) = map.get("_order") {
+            w.desc = s.eq_ignore_ascii_case("desc");
+        }
+        if let Some(v) = map.get("_cursor").and_then(int_val) {
+            w.cursor = Some(v as u64);
         }
     }
-    (limit, offset)
+    w
+}
+
+/// Slice sorted row refs to a window. `rows` must already be sorted per `desc`.
+/// Cursor is exclusive: asc keeps id > cursor, desc keeps id < cursor
+/// (cursor 0/None = from the head). Returns [start, end) byte offsets.
+fn apply_window(len: usize, ids_asc: bool, w: &ScanWindow, id_at: &dyn Fn(usize) -> u64) -> (usize, usize) {
+    let mut start = 0usize;
+    if let Some(c) = w.cursor {
+        if ids_asc && !w.desc {
+            // ascending: first id > c
+            let mut lo = 0usize;
+            let mut hi = len;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if id_at(mid) <= c {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            start = lo;
+        } else {
+            // descending array: first id < c (linear from head is O(limit)
+            // only when cursor used without offset; keep binary variant:
+            // descending ids => ascending negated; equivalent partition:
+            let mut lo = 0usize;
+            let mut hi = len;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if id_at(mid) >= c {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            start = lo;
+        }
+    }
+    start = (start + w.offset).min(len);
+    let end = (start + w.limit).min(len).max(start);
+    (start, end)
 }
 
 /// Execute one request. Infallible by design: engine failures become
@@ -163,6 +228,7 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
                     if let Some(key) = idem {
                         server.idem_record(key, assigned.as_u64());
                     }
+                    server.record_change(&req.table, "insert", assigned.as_u64());
                     Response::ok(
                         id,
                         vec![RowView {
@@ -203,6 +269,7 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
                     if let Err(w) = server.wal_log(blitz_wal::EntryType::Update, &req.table, row_id.as_u64(), data) {
                         return Response::err(id, format!("WAL backpressure: {}", w));
                     }
+                    server.record_change(&req.table, "update", row_id.as_u64());
                     Response::ok(
                         id,
                         vec![RowView {
@@ -224,6 +291,7 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
                     if let Err(w) = server.wal_log(blitz_wal::EntryType::Delete, &req.table, row_id.as_u64(), Vec::new()) {
                         return Response::err(id, format!("WAL backpressure: {}", w));
                     }
+                    server.record_change(&req.table, "delete", row_id.as_u64());
                     Response::ok(id, Vec::new())
                 }
                 Ok(false) => Response::err(id, format!("row not found: {}", row_id)),
@@ -231,16 +299,20 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
             }
         }
         Op::Scan => {
-            let (limit, offset) = scan_pagination(&req.values);
+            let w = scan_pagination(&req.values);
             match server.engine().scan_arcs(&req.table) {
-                // Paginated scan: sort by RowId for stable pages, then
-                // slice. Sorting N ids is cheaper than encoding N rows,
-                // and the limit bounds both CPU and frame size.
+                // Paginated + cursor scan over RowId order. The limit bounds
+                // CPU/frame; cursor (binary search) keeps pages stable under
+                // concurrent inserts. NOTE: per-request full sort — hot
+                // timeline paths must use precomputed feeds (Stage 9+), not
+                // scans; this primitive is for admin/backfill pages.
                 Ok(mut rows) => {
-                    rows.sort_by_key(|r| r.id);
-                    let total = rows.len();
-                    let start = offset.min(total);
-                    let end = (start + limit).min(total);
+                    if w.desc {
+                        rows.sort_by_key(|r| std::cmp::Reverse(r.id));
+                    } else {
+                        rows.sort_by_key(|r| r.id);
+                    }
+                    let (start, end) = apply_window(rows.len(), !w.desc, &w, &|i| rows[i].id.as_u64());
                     let views = rows[start..end]
                         .iter()
                         .map(|row| row_to_view(row.id, row))
@@ -249,7 +321,66 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
                 }
                 Err(e) => Response::err(id, e.to_string()),
             }
-        },
+        }
+        Op::Find => {
+            let (col, val) = match req.values.as_ref().and_then(|m| {
+                match (m.get("_col"), m.get("_val")) {
+                    (Some(blitz_types::value::Value::String(c)), Some(v)) => Some((c.clone(), v.clone())),
+                    _ => None,
+                }
+            }) {
+                Some(cv) => cv,
+                None => return Response::err(id, "find requires values {_col: String, _val: Value}"),
+            };
+            match server.engine().lookup_by_unique(&req.table, &col, &val) {
+                Ok(Some(row)) => {
+                    let rid = row.id;
+                    Response::ok(id, vec![row_to_view(rid, &row)])
+                }
+                Ok(None) => Response::err(id, "not found"),
+                Err(e) => Response::err(id, e.to_string()),
+            }
+        }
+        Op::Subscribe => {
+            use blitz_types::value::Value as V;
+            let mut since = 0u64;
+            let mut limit = 100usize;
+            if let Some(m) = req.values.as_ref() {
+                if let Some(v) = m.get("_since") {
+                    since = match v {
+                        V::Int64(n) => (*n).max(0) as u64,
+                        V::UInt64(n) => *n,
+                        V::Int32(n) => (*n).max(0) as u64,
+                        V::UInt32(n) => *n as u64,
+                        _ => 0,
+                    };
+                }
+                if let Some(v) = m.get("_limit") {
+                    limit = match v {
+                        V::Int64(n) => (*n).max(0) as usize,
+                        V::UInt64(n) => *n as usize,
+                        _ => 100,
+                    }
+                    .clamp(1, MAX_SUBSCRIBE_LIMIT);
+                }
+            }
+            let recs = server.read_changes(&req.table, since, limit);
+            let rows = recs
+                .iter()
+                .map(|r| RowView {
+                    id: r.seq,
+                    values: [
+                        ("table".to_string(), V::String(r.table.clone())),
+                        ("op".to_string(), V::String(r.op.to_string())),
+                        ("row_id".to_string(), V::Int64(r.row_id as i64)),
+                        ("ts".to_string(), V::Int64(r.ts_micros as i64)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                })
+                .collect();
+            Response::ok(id, rows)
+        }
     }
 }
 
@@ -292,13 +423,15 @@ fn encode_scan_fast(
     req: &Request,
 ) -> anyhow::Result<bytes::Bytes> {
     let id = req.id;
-    let (limit, offset) = scan_pagination(&req.values);
+    let w = scan_pagination(&req.values);
     match server.engine().scan_arcs(&req.table) {
         Ok(mut rows) => {
-            rows.sort_by_key(|r| r.id);
-            let total = rows.len();
-            let start = offset.min(total);
-            let end = (start + limit).min(total);
+            if w.desc {
+                rows.sort_by_key(|r| std::cmp::Reverse(r.id));
+            } else {
+                rows.sort_by_key(|r| r.id);
+            }
+            let (start, end) = apply_window(rows.len(), !w.desc, &w, &|i| rows[i].id.as_u64());
             let borrowed: Vec<(u64, &std::collections::HashMap<String, blitz_types::value::Value>)> =
                 rows[start..end].iter().map(|r| (r.id.as_u64(), &r.values)).collect();
             match codec.encode_ok_borrowed(id, &borrowed) {
@@ -316,22 +449,31 @@ fn encode_scan_fast(
 
 /// Serve one connection until the client disconnects or a fatal I/O or
 /// framing error occurs.
-async fn handle_connection(server: Arc<BlitzServer>, mut socket: TcpStream) -> Result<()> {
+async fn handle_connection(server: Arc<BlitzServer>, socket: TcpStream) -> Result<()> {
+    // Disable Nagle: this is a request/response protocol with small frames,
+    // so waiting to coalesce segments would add pure latency.
+    socket.set_nodelay(true).context("failed to set TCP_NODELAY")?;
+    let peer_ip = socket.peer_addr().ok().map(|a| a.ip());
+    handle_stream(server, socket, peer_ip).await
+}
+
+/// Framing/dispatch loop over any byte stream (plain TCP or TLS).
+/// Shared so TLS adds only handshake cost, no second protocol path.
+async fn handle_stream(
+    server: Arc<BlitzServer>,
+    mut stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    peer_ip: Option<std::net::IpAddr>,
+) -> Result<()> {
     // Fast shed: when prod sets `shed_at_connections`, new connections past
     // the watermark fail fast (close) instead of queueing and exploding p99.
     if server.should_shed() {
         server.record_shed_drop();
         return Ok(());
     }
-    let peer_ip = socket.peer_addr().ok().map(|a| a.ip());
     let _guard = match ConnectionGuard::new(&server, peer_ip) {
         Some(g) => g,
         None => return Ok(()), // at capacity / per-IP cap: close immediately
     };
-
-    // Disable Nagle: this is a request/response protocol with small frames,
-    // so waiting to coalesce segments would add pure latency.
-    socket.set_nodelay(true).context("failed to set TCP_NODELAY")?;
 
     let max_frame = server.config().max_message_size;
     let idle_secs = server.config().idle_timeout_secs;
@@ -339,6 +481,10 @@ async fn handle_connection(server: Arc<BlitzServer>, mut socket: TcpStream) -> R
     // Pre-size 4 KiB (typical request) to avoid first-read realloc;
     // growth is bounded below by the slow-loris cap.
     let mut staging = BytesMut::with_capacity(4096);
+    // Connection-bound identity: set by any op carrying `_auth`, persists
+    // for the life of the connection (per-op re-resolution would cost a
+    // map lookup per request; this keeps authed steady-state at ~ns).
+    let mut authed: Option<blitz_auth::Identity> = None;
 
     loop {
         // Idle reaping: keep-alive conns that go silent past the deadline
@@ -346,7 +492,7 @@ async fn handle_connection(server: Arc<BlitzServer>, mut socket: TcpStream) -> R
         let n = if idle_secs > 0 {
             match tokio::time::timeout(
                 std::time::Duration::from_secs(idle_secs),
-                socket.read_buf(&mut staging),
+                stream.read_buf(&mut staging),
             )
             .await
             {
@@ -355,7 +501,7 @@ async fn handle_connection(server: Arc<BlitzServer>, mut socket: TcpStream) -> R
                 Ok(Ok(n)) => n,
             }
         } else {
-            socket
+            stream
                 .read_buf(&mut staging)
                 .await
                 .context("failed to read from socket")?
@@ -382,30 +528,42 @@ async fn handle_connection(server: Arc<BlitzServer>, mut socket: TcpStream) -> R
                 .context("decode error: closing connection")?;
             // Batch and single share one frame budget: a batch of N costs
             // one read + one write instead of N round trips.
+            // Auth: `_auth` token in any op's values handshakes the
+            // connection (identity persists); denied ops become err payloads
+            // without touching engine/WAL/change-log.
             let t0 = std::time::Instant::now();
             let encoded = match incoming {
                 // Get/Scan use zero-copy borrowed encode (no Value clones).
-                Incoming::Single(req) if req.op == Op::Get => {
-                    encode_get_fast(&server, &codec, &req).context("encode error")?
-                }
-                Incoming::Single(req) if req.op == Op::Scan => {
-                    encode_scan_fast(&server, &codec, &req).context("encode error")?
-                }
-                Incoming::Single(req) => {
-                    let resp = dispatch(&server, req);
-                    // A giant Scan could exceed the frame budget; report it
-                    // as an error payload instead of killing the connection.
-                    match codec.encode_response(&resp) {
-                        Ok(f) => f,
-                        Err(_) => {
-                            let err = Response::err(
-                                resp.id,
-                                format!(
-                                    "response too large ({} rows)",
-                                    resp.rows.len()
-                                ),
-                            );
-                            codec.encode_response(&err).context("encode error")?
+                Incoming::Single(mut req) => {
+                    if let Some(tok) = take_auth_token(&mut req.values) {
+                        if let Some(id) = server.resolve_token(&tok) {
+                            authed = Some(id);
+                        }
+                    }
+                    if let Err(e) = server.authorize(&authed, req.op, &req.table) {
+                        let rid = req.id;
+                        codec.encode_response(&Response::err(rid, e)).context("encode error")?
+                    } else if req.op == Op::Get {
+                        encode_get_fast(&server, &codec, &req).context("encode error")?
+                    } else if req.op == Op::Scan {
+                        encode_scan_fast(&server, &codec, &req).context("encode error")?
+                    } else {
+                        let resp = dispatch(&server, req);
+                        // A giant response could exceed the frame budget;
+                        // report it as an error payload instead of killing
+                        // the connection.
+                        match codec.encode_response(&resp) {
+                            Ok(f) => f,
+                            Err(_) => {
+                                let err = Response::err(
+                                    resp.id,
+                                    format!(
+                                        "response too large ({} rows)",
+                                        resp.rows.len()
+                                    ),
+                                );
+                                codec.encode_response(&err).context("encode error")?
+                            }
                         }
                     }
                 }
@@ -417,8 +575,16 @@ async fn handle_connection(server: Arc<BlitzServer>, mut socket: TcpStream) -> R
                         codec.encode_response(&err).context("encode error")?
                     } else {
                         let mut results = Vec::with_capacity(batch.ops.len());
-                        for op in batch.ops {
-                            results.push(dispatch(&server, op));
+                        for mut op in batch.ops {
+                            if let Some(tok) = take_auth_token(&mut op.values) {
+                                if let Some(id) = server.resolve_token(&tok) {
+                                    authed = Some(id);
+                                }
+                            }
+                            match server.authorize(&authed, op.op, &op.table) {
+                                Err(e) => results.push(Response::err(op.id, e)),
+                                Ok(()) => results.push(dispatch(&server, op)),
+                            }
                         }
                         let bresp = BatchResponse {
                             id: batch.id,
@@ -445,7 +611,7 @@ async fn handle_connection(server: Arc<BlitzServer>, mut socket: TcpStream) -> R
             let elapsed_us = t0.elapsed().as_micros() as u64;
             server.record_request(elapsed_us > slow_us);
             let wlen = encoded.len() as u64;
-            socket
+            stream
                 .write_all(&encoded)
                 .await
                 .context("failed to write to socket")?;
@@ -530,6 +696,73 @@ pub async fn serve_reuseport(
         t.await?;
     }
     Ok(())
+}
+
+/// Build a TLS acceptor from DER cert chain + PKCS#8 DER key.
+/// Use `serve_tls` with it; plaintext `serve` stays for loopback/bench.
+/// Terminate at a reverse proxy if rotation/OCSP is needed — in-process TLS
+/// here covers single-node prod without extra hops.
+pub fn tls_acceptor_from_der(
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<tokio_rustls::TlsAcceptor> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let cert = CertificateDer::from(cert_der);
+    let key = PrivateKeyDer::Pkcs8(key_der.into());
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .context("invalid TLS cert/key")?;
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg)))
+}
+
+/// Load PEM cert chain + first private key (PKCS#8 or RSA) from files.
+pub fn tls_acceptor_from_pem_files(cert_path: &str, key_path: &str) -> Result<tokio_rustls::TlsAcceptor> {
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    use std::io::BufReader;
+    let cert_file = std::fs::File::open(cert_path).context("open tls cert")?;
+    let certs: Vec<CertificateDer> =
+        rustls_pemfile::certs(&mut BufReader::new(cert_file)).collect::<Result<_, _>>()?;
+    if certs.is_empty() {
+        anyhow::bail!("no certs in {}", cert_path);
+    }
+    let key_file = std::fs::File::open(key_path).context("open tls key")?;
+    let key = rustls_pemfile::private_key(&mut BufReader::new(key_file))?
+        .ok_or_else(|| anyhow::anyhow!("no private key in {}", key_path))?;
+    let key: PrivateKeyDer = key.into();
+    let cfg = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .context("invalid TLS cert/key")?;
+    Ok(tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(cfg)))
+}
+
+/// TLS accept loop: handshake, then the shared framing/dispatch path.
+/// Failed handshakes close without a slot leak (guard lives in `handle_stream`).
+pub async fn serve_tls(
+    server: Arc<BlitzServer>,
+    listener: TcpListener,
+    acceptor: tokio_rustls::TlsAcceptor,
+) -> Result<()> {
+    loop {
+        let (socket, _peer) = listener.accept().await.context("tls accept failed")?;
+        let _ = socket.set_nodelay(true);
+        let peer_ip = socket.peer_addr().ok().map(|a| a.ip());
+        let acceptor = acceptor.clone();
+        let server = Arc::clone(&server);
+        tokio::spawn(async move {
+            let tls = match acceptor.accept(socket).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::debug!("tls handshake failed: {:#}", e);
+                    return;
+                }
+            };
+            if let Err(e) = handle_stream(server, tls, peer_ip).await {
+                tracing::debug!("tls connection ended: {:#}", e);
+            }
+        });
+    }
 }
 
 /// Minimal HTTP ops surface: `GET /metrics` (Prometheus exposition) and
@@ -928,6 +1161,346 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_require_auth_handshake_and_enforcement() {
+        use crate::server::ServerConfig;
+        use blitz_auth::{Identity, Permission};
+        let token = "tok-abc-123".to_string();
+        let ident = Identity::new("alice")
+            .with_permission(Permission::Read)
+            .with_permission(Permission::Write);
+        let mut cfg = ServerConfig::default();
+        cfg.require_auth = true;
+        cfg.auth_tokens.insert(token.clone(), ident);
+        let server = Arc::new(BlitzServer::with_config(cfg));
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+
+        // Unauthenticated write → unauthorized, nothing stored.
+        let r = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("name", Value::String("X".into())),
+                    ("email", Value::String("x@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("unauthorized"), "got {:?}", r);
+        assert_eq!(server.engine().count("users").unwrap(), 0);
+
+        // Wrong token stays unauthenticated.
+        let r = client
+            .roundtrip(&Request {
+                id: 2,
+                op: Op::Ping,
+                table: String::new(),
+                row_id: None,
+                values: Some(values(&[("_auth", Value::String("bogus".into()))])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok); // Ping always ok, but identity NOT set
+        let r = client
+            .roundtrip(&Request {
+                id: 3,
+                op: Op::Get,
+                table: "users".into(),
+                row_id: Some(1),
+                values: None,
+            })
+            .await
+            .unwrap();
+        assert!(!r.ok, "bogus token must not authenticate");
+
+        // Correct handshake via Ping+_auth binds the connection.
+        let r = client
+            .roundtrip(&Request {
+                id: 4,
+                op: Op::Ping,
+                table: String::new(),
+                row_id: None,
+                values: Some(values(&[("_auth", Value::String(token))])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok);
+        // Now the same connection writes fine (Write granted).
+        let r = client
+            .roundtrip(&Request {
+                id: 5,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("name", Value::String("X".into())),
+                    ("email", Value::String("x@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "authed write failed: {:?}", r.error);
+        // ...but Delete (not granted, no policy rules) is forbidden.
+        let row = r.rows[0].id;
+        let r = client
+            .roundtrip(&Request { id: 6, op: Op::Delete, table: "users".into(), row_id: Some(row), values: None })
+            .await
+            .unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("forbidden"), "got {:?}", r);
+    }
+
+    #[tokio::test]
+    async fn test_find_lookup_by_unique() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let ins = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(7)),
+                    ("name", Value::String("Findme".into())),
+                    ("email", Value::String("find@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(ins.ok);
+        // Hit.
+        let r = client
+            .roundtrip(&Request {
+                id: 2,
+                op: Op::Find,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("_col", Value::String("email".into())),
+                    ("_val", Value::String("find@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        assert_eq!(r.rows[0].id, ins.rows[0].id);
+        // Miss → err (not empty-ok, so clients can distinguish).
+        let r = client
+            .roundtrip(&Request {
+                id: 3,
+                op: Op::Find,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("_col", Value::String("email".into())),
+                    ("_val", Value::String("nope@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(!r.ok);
+        // Non-unique column → rejected, never a full scan.
+        let r = client
+            .roundtrip(&Request {
+                id: 4,
+                op: Op::Find,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("_col", Value::String("name".into())),
+                    ("_val", Value::String("Findme".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(!r.ok, "non-unique find must fail, got {:?}", r);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_long_poll_with_since_and_limit() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let sub = |id: u64, since: u64, limit: i64| Request {
+            id,
+            op: Op::Subscribe,
+            table: "users".into(),
+            row_id: None,
+            values: Some(values(&[
+                ("_since", Value::Int64(since as i64)),
+                ("_limit", Value::Int64(limit)),
+            ])),
+        };
+        // Empty at first.
+        let r = client.roundtrip(&sub(1, 0, 100)).await.unwrap();
+        assert!(r.ok && r.rows.is_empty(), "got {:?}", r);
+        // Two writes → two records, oldest first.
+        for i in 0..2 {
+            let r = client
+                .roundtrip(&Request {
+                    id: 10 + i,
+                    op: Op::Insert,
+                    table: "users".into(),
+                    row_id: None,
+                    values: Some(values(&[
+                        ("id", Value::Int64(100 + i as i64)),
+                        ("name", Value::String(format!("S{}", i))),
+                        ("email", Value::String(format!("s{}@x.com", i))),
+                    ])),
+                })
+                .await
+                .unwrap();
+            assert!(r.ok);
+        }
+        let r = client.roundtrip(&sub(20, 0, 100)).await.unwrap();
+        assert!(r.ok && r.rows.len() == 2, "got {:?}", r);
+        assert!(r.rows[0].id < r.rows[1].id);
+        // _since filters to newer only; _limit caps.
+        let ts = r.rows[0].values.get("ts").cloned();
+        let since = match ts {
+            Some(Value::Int64(n)) => n as u64,
+            _ => panic!("record missing ts: {:?}", r.rows[0]),
+        };
+        let r2 = client.roundtrip(&sub(21, since, 100)).await.unwrap();
+        assert!(r2.ok && r2.rows.len() == 1, "got {:?}", r2);
+        let r3 = client.roundtrip(&sub(22, 0, 1)).await.unwrap();
+        assert!(r3.ok && r3.rows.len() == 1, "limit ignored: {:?}", r3);
+    }
+
+    #[tokio::test]
+    async fn test_scan_cursor_desc_pages_without_overlap() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        for i in 0..6 {
+            let r = client
+                .roundtrip(&Request {
+                    id: i,
+                    op: Op::Insert,
+                    table: "users".into(),
+                    row_id: None,
+                    values: Some(values(&[
+                        ("id", Value::Int64(i as i64)),
+                        ("name", Value::String("n".into())),
+                        ("email", Value::String(format!("cu{}@x.com", i))),
+                    ])),
+                })
+                .await
+                .unwrap();
+            assert!(r.ok);
+        }
+        // Page 1 desc limit 2 → two largest ids.
+        let p1 = client
+            .roundtrip(&Request {
+                id: 100,
+                op: Op::Scan,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("_limit", Value::Int64(2)),
+                    ("_order", Value::String("desc".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(p1.ok && p1.rows.len() == 2, "got {:?}", p1);
+        assert!(p1.rows[0].id > p1.rows[1].id);
+        // Page 2 via cursor (exclusive) → next two, no overlap.
+        let cursor = p1.rows[1].id;
+        let p2 = client
+            .roundtrip(&Request {
+                id: 101,
+                op: Op::Scan,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("_limit", Value::Int64(2)),
+                    ("_order", Value::String("desc".into())),
+                    ("_cursor", Value::UInt64(cursor)),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(p2.ok && p2.rows.len() == 2, "got {:?}", p2);
+        assert!(!p2.rows.iter().any(|r| r.id == p1.rows[0].id || r.id == cursor));
+        assert!(p2.rows[0].id < cursor);
+    }
+
+    #[tokio::test]
+    async fn test_batch_is_not_atomic_partial_failure_commits_rest() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        // Seed one row with a taken email.
+        let seed = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("name", Value::String("Seed".into())),
+                    ("email", Value::String("taken@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(seed.ok);
+        // Batch: [dup-email insert (fails), fresh insert (must still commit)].
+        let b = roundtrip_batch(&mut client, 50, vec![
+            Request {
+                id: 51,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(2)),
+                    ("name", Value::String("Dup".into())),
+                    ("email", Value::String("taken@example.com".into())),
+                ])),
+            },
+            Request {
+                id: 52,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(3)),
+                    ("name", Value::String("Fresh".into())),
+                    ("email", Value::String("fresh@example.com".into())),
+                ])),
+            },
+        ])
+        .await
+        .unwrap();
+        assert!(!b.results[0].ok, "dup must fail");
+        assert!(b.results[1].ok, "sibling must commit despite partial failure");
+        assert_eq!(server.engine().count("users").unwrap(), 2);
+    }
+
+    #[tokio::test]
     async fn test_unique_email_rejected() {
         let server = Arc::new(BlitzServer::new());
         server.start().await.unwrap();
@@ -1205,5 +1778,47 @@ mod tests {
         assert_eq!(server.stats().total_requests, 1);
         assert_eq!(server.stats().slow_responses, 1);
         assert_eq!(server.slow_rate(), Some(1.0));
+    }
+
+    #[tokio::test]
+    async fn test_tls_ping_roundtrip_self_signed() {
+        // rcgen self-signed server cert; client pins its DER (no custom
+        // verifier, no network PKI — test-only trust).
+        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+        let cert_der = cert.serialize_der().unwrap();
+        let key_der = cert.serialize_private_key_der();
+        let acceptor = super::tls_acceptor_from_der(cert_der.clone(), key_der).unwrap();
+
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(super::serve_tls(Arc::clone(&server), listener, acceptor));
+
+        use rustls::pki_types::ServerName;
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.into()).unwrap();
+        let ccfg = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(ccfg));
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from("localhost").unwrap().to_owned();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+
+        // Raw Ping frame over the TLS stream.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let codec = FrameCodec::with_default_limit();
+        let frame = codec.encode_request(&Request::ping(7)).unwrap();
+        tls.write_all(&frame).await.unwrap();
+        let mut buf = BytesMut::new();
+        let resp = loop {
+            if let Some(p) = codec.feed(&mut buf).unwrap() {
+                break codec.decode_response(p).unwrap();
+            }
+            let n = tls.read_buf(&mut buf).await.unwrap();
+            assert!(n > 0, "tls server closed");
+        };
+        assert!(resp.ok && resp.id == 7, "got {:?}", resp);
     }
 }

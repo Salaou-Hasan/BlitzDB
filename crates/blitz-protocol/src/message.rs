@@ -18,6 +18,14 @@ pub enum Op {
     Update,
     Delete,
     Scan,
+    /// Bounded change long-poll: recent writes to `table` after `_since`.
+    /// Polling (not push) keeps framing strictly request/response so
+    /// pipelining/batching math and tail budgets stay intact.
+    Subscribe,
+    /// O(1) point lookup via a unique/PK column:
+    /// `values {_col: String, _val: Value}`. Non-unique columns are rejected
+    /// instead of degrading into full scans on the hot path.
+    Find,
 }
 
 impl Op {
@@ -29,6 +37,8 @@ impl Op {
             Op::Update => 3,
             Op::Delete => 4,
             Op::Scan => 5,
+            Op::Subscribe => 6,
+            Op::Find => 7,
         }
     }
 
@@ -40,6 +50,8 @@ impl Op {
             3 => Some(Op::Update),
             4 => Some(Op::Delete),
             5 => Some(Op::Scan),
+            6 => Some(Op::Subscribe),
+            7 => Some(Op::Find),
             _ => None,
         }
     }
@@ -140,11 +152,13 @@ mod tests {
             (Op::Update, 3),
             (Op::Delete, 4),
             (Op::Scan, 5),
+            (Op::Subscribe, 6),
+            (Op::Find, 7),
         ] {
             assert_eq!(op.tag(), tag);
             assert_eq!(Op::from_tag(tag), Some(op));
         }
-        assert_eq!(Op::from_tag(6), None);
+        assert_eq!(Op::from_tag(8), None);
         assert_eq!(Op::from_tag(255), None);
     }
 

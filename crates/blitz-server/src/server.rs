@@ -1,8 +1,9 @@
 use anyhow::Result;
-use blitz_auth::Identity;
+use blitz_auth::{Identity, Permission};
 use blitz_core::{InMemoryTableEngine, TableEngine};
 use blitz_events::{Event, EventEmitter, EventKind};
 use blitz_policy::PolicyEngine;
+use blitz_protocol::Op;
 use blitz_realtime::{Delta, SubscriptionManager};
 use blitz_tx::TransactionManager;
 use blitz_types::column::{ColumnDef, ColumnType};
@@ -10,11 +11,25 @@ use blitz_types::id::RowId;
 use blitz_types::row::Row;
 use blitz_types::schema::TableSchema;
 use blitz_types::value::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     RwLock,
 };
+
+/// One committed write, for bounded `Subscribe` long-poll reads.
+/// Pushed only for acked writes (never for denied/shed ops).
+#[derive(Debug, Clone)]
+pub struct ChangeRecord {
+    pub seq: u64,
+    pub table: String,
+    pub op: &'static str,
+    pub row_id: u64,
+    pub ts_micros: u64,
+}
+
+/// Max retained change records per table (long-poll window).
+pub const MAX_CHANGES_PER_TABLE: usize = 128;
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -49,6 +64,15 @@ pub struct ServerConfig {
     /// 8-IP bench harness stays under it at 50K (6250/IP); single-IP prod
     /// clients should raise it, public endpoints lower it.
     pub max_connections_per_ip: usize,
+    /// Reject unauthenticated ops when true (default false = bypass, benches).
+    /// With true: clients handshake via any op carrying
+    /// `values {"_auth": token}` (usually `Ping`); the identity binds to the
+    /// connection. Direct permissions or policy allow-rules then apply.
+    pub require_auth: bool,
+    /// Pre-shared bearer tokens → identity (seeded into the runtime
+    /// identities map at `start`). Prefer short-lived tokens via
+    /// `register_identity` for rotation without restart.
+    pub auth_tokens: HashMap<String, Identity>,
 }
 
 impl Default for ServerConfig {
@@ -67,6 +91,8 @@ impl Default for ServerConfig {
             snapshot_secs: 0,
             idle_timeout_secs: 300,
             max_connections_per_ip: 20_000,
+            require_auth: false,
+            auth_tokens: HashMap::new(),
         }
     }
 }
@@ -120,6 +146,13 @@ pub struct BlitzServer {
     idem: RwLock<HashMap<String, u64>>,
     /// Live connections per source IP for per-IP caps.
     ips: std::sync::Mutex<HashMap<std::net::IpAddr, usize>>,
+    /// Bounded recent-write log per table for `Subscribe` polls.
+    changes: RwLock<HashMap<String, std::sync::Arc<std::sync::Mutex<VecDeque<ChangeRecord>>>>>,
+    change_seq: std::sync::atomic::AtomicU64,
+    /// Sticky: set on first `Subscribe`. `record_change` early-returns while
+    /// false, so write-only workloads (benches, cache shards) pay zero
+    /// change-log cost (no clock read, no map lock).
+    changes_used: AtomicBool,
 }
 
 impl BlitzServer {
@@ -146,6 +179,9 @@ impl BlitzServer {
             wal_rotating: AtomicBool::new(false),
             idem: RwLock::new(HashMap::new()),
             ips: std::sync::Mutex::new(HashMap::new()),
+            changes: RwLock::new(HashMap::new()),
+            change_seq: std::sync::atomic::AtomicU64::new(1),
+            changes_used: AtomicBool::new(false),
         }
     }
 
@@ -435,6 +471,97 @@ impl BlitzServer {
         }
     }
 
+    /// Resolve a bearer token to an identity (pre-shared config tokens +
+    /// runtime `register_identity` map). One HashMap lookup per connection
+    /// handshake — far under the 1ms auth/policy budget.
+    pub fn resolve_token(&self, token: &str) -> Option<Identity> {
+        self.identities.read().ok().and_then(|g| g.get(token).cloned())
+    }
+
+    /// Authorize one op for an (optionally authenticated) connection.
+    /// `Ping` always passes (handshake + probes carry no data).
+    /// Bypass when `!require_auth` (bench default). Otherwise: direct
+    /// identity permission (or admin) wins; then policy allow-rules; deny
+    /// by default with zero rules (secure closed default).
+    pub fn authorize(
+        &self,
+        ident: &Option<Identity>,
+        op: Op,
+        table: &str,
+    ) -> Result<(), &'static str> {
+        if matches!(op, Op::Ping) {
+            return Ok(());
+        }
+        if !self.config.require_auth {
+            return Ok(());
+        }
+        let perm: Permission = match op {
+            Op::Insert | Op::Update => Permission::Write,
+            Op::Get | Op::Scan | Op::Find | Op::Subscribe => Permission::Read,
+            Op::Delete => Permission::Delete,
+            Op::Ping => return Ok(()),
+        };
+        let id = ident.as_ref().ok_or("unauthorized: authentication required")?;
+        if id.has_permission(&perm) {
+            return Ok(());
+        }
+        match self.policy_engine.check(id, table, &perm) {
+            Ok(true) => Ok(()),
+            _ => Err("forbidden: policy denies"),
+        }
+    }
+
+    /// Record a committed write for `Subscribe` polls. Bounded 128/table;
+    /// per-table deque locks (tables don't contend). Called only for acked
+    /// writes — denied/shed ops never appear. Zero-cost until the first
+    /// `Subscribe` arrives (sticky flag).
+    pub fn record_change(&self, table: &str, op: &'static str, row_id: u64) {
+        use std::sync::atomic::Ordering as O;
+        if !self.changes_used.load(O::Relaxed) {
+            return;
+        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        let seq = self.change_seq.fetch_add(1, O::Relaxed);
+        let rec = ChangeRecord { seq, table: table.to_string(), op, row_id, ts_micros: ts };
+        let deque = {
+            match self.changes.read().ok().and_then(|m| m.get(table).cloned()) {
+                Some(d) => d,
+                None => {
+                    let d = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
+                    if let Ok(mut m) = self.changes.write() {
+                        m.entry(table.to_string()).or_insert_with(|| std::sync::Arc::clone(&d));
+                    }
+                    d
+                }
+            }
+        };
+        if let Ok(mut q) = deque.lock() {
+            q.push_back(rec);
+            while q.len() > MAX_CHANGES_PER_TABLE {
+                q.pop_front();
+            }
+        };
+    }
+
+    /// Read changes for `table` with `ts_micros > since`, oldest first,
+    /// capped at `limit` (clamped to 1000). Arms the change log.
+    pub fn read_changes(&self, table: &str, since: u64, limit: usize) -> Vec<ChangeRecord> {
+        use std::sync::atomic::Ordering as O;
+        self.changes_used.store(true, O::Relaxed);
+        let limit = limit.clamp(1, 1000);
+        let limit = limit.clamp(1, 1000);
+        match self.changes.read().ok().and_then(|m| m.get(table).cloned()) {
+            Some(d) => match d.lock() {
+                Ok(q) => q.iter().filter(|r| r.ts_micros > since).take(limit).cloned().collect(),
+                Err(_) => Vec::new(),
+            },
+            None => Vec::new(),
+        }
+    }
+
     /// Prometheus exposition for the SLO contract fields.
     pub fn metrics_text(&self) -> String {
         let s = self.stats();
@@ -495,6 +622,16 @@ impl BlitzServer {
                 )?;
                 if cluster.is_enabled() {
                     *self.wal.write().unwrap() = Some(cluster);
+                }
+            }
+        }
+
+        // Seed pre-shared bearer tokens (rotation without restart via
+        // `register_identity`).
+        if !self.config.auth_tokens.is_empty() {
+            if let Ok(mut m) = self.identities.write() {
+                for (tok, ident) in &self.config.auth_tokens {
+                    m.insert(tok.clone(), ident.clone());
                 }
             }
         }

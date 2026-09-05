@@ -484,6 +484,29 @@ pub fn save_snapshot(engine: &InMemoryTableEngine, data_dir: &str) -> anyhow::Re
     Ok(mgr.create_snapshot(&tables, &[], wal_seq)?)
 }
 
+/// Offline rotation: recover everything into a scratch engine, write a fresh
+/// snapshot, then truncate all WAL files. Run stopped-server only (the live
+/// `snapshot_and_rotate` quiesces instead). Bounds restart replay time.
+pub fn offline_rotate(data_dir: &str) -> anyhow::Result<PathBuf> {
+    let engine = InMemoryTableEngine::new();
+    let (_tables, _rows, _replayed) = recover(&engine, data_dir)?;
+    let snap = save_snapshot(&engine, data_dir)?;
+    let mut wals = vec![PathBuf::from(data_dir).join("wal.log")];
+    for i in 0..WalCluster::shards_for_mode() {
+        wals.push(PathBuf::from(data_dir).join(format!("wal_{:02}.log", i)));
+    }
+    for p in wals {
+        if p.exists() {
+            if let Ok(mut w) = blitz_wal::WriteAheadLog::open(&p) {
+                let _ = w.truncate();
+            }
+        }
+    }
+    let mgr = blitz_snapshot::SnapshotManager::new(PathBuf::from(data_dir).join("snapshots"));
+    let _ = mgr.prune(3);
+    Ok(snap)
+}
+
 /// Load latest snapshot + replay WAL entries after its sequence.
 /// Returns (tables_restored, rows_restored, wal_replayed).
 pub fn recover(engine: &InMemoryTableEngine, data_dir: &str) -> anyhow::Result<(usize, usize, usize)> {
@@ -866,5 +889,96 @@ mod backup_tests {
         let (tables, rows, _) = recover(&e2, backup.to_str().unwrap()).unwrap();
         assert_eq!((tables, rows), (1, 5));
         assert_eq!(e2.count("t").unwrap(), 5);
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+    use crate::server::{BlitzServer, ServerConfig};
+    use blitz_core::TableEngine;
+
+    #[test]
+    fn snapshot_and_rotate_preserves_data_and_truncates_wal() {
+        let dir = std::env::temp_dir().join(format!(
+            "blitz-rot-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap().to_string();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let cfg = ServerConfig {
+                data_dir: Some(d.clone()),
+                durability: DurabilityMode::near_sync(),
+                ..Default::default()
+            };
+            let s = BlitzServer::with_config(cfg);
+            s.start().await.unwrap();
+            s.engine()
+                .create_table(
+                    TableSchema::new("t")
+                        .with_column(ColumnDef::new("id", ColumnType::Int64).nullable())
+                        .with_column(ColumnDef::new("v", ColumnType::String).nullable()),
+                )
+                .unwrap();
+            for i in 0..3i64 {
+                let mut m: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+                m.insert("id".into(), Value::Int64(i));
+                m.insert("v".into(), Value::String(format!("r{}", i)));
+                let mut row = Row::new(RowId::new(0));
+                for (k, v) in &m {
+                    row.set(k.clone(), v.clone());
+                }
+                let assigned = s.engine().insert("t", row).unwrap();
+                let data = values_to_json_bytes(&m);
+                s.wal_log(blitz_wal::EntryType::Insert, "t", assigned.as_u64(), data).unwrap();
+            }
+            // Drain groups, then rotate.
+            let start = std::time::Instant::now();
+            loop {
+                if s.stats().wal_ops >= 3 {
+                    break;
+                }
+                assert!(start.elapsed() < Duration::from_secs(5));
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let snap = s.snapshot_and_rotate().unwrap();
+            assert!(snap.exists());
+            // WAL shard files truncated away (or tiny fresh headers).
+            let mut wal_bytes = 0u64;
+            for i in 0..WalCluster::shards_for_mode() {
+                let p = dir.join(format!("wal_{:02}.log", i));
+                if p.exists() {
+                    wal_bytes += std::fs::metadata(&p).unwrap().len();
+                }
+            }
+            assert!(wal_bytes < 4096, "wal not truncated: {} bytes", wal_bytes);
+            // Live server keeps serving after rotation.
+            let mut m: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+            m.insert("id".into(), Value::Int64(99));
+            m.insert("v".into(), Value::String("post".into()));
+            let mut row = Row::new(RowId::new(0));
+            for (k, v) in &m {
+                row.set(k.clone(), v.clone());
+            }
+            let nid = s.engine().insert("t", row).unwrap();
+            let data = values_to_json_bytes(&m);
+            s.wal_log(blitz_wal::EntryType::Insert, "t", nid.as_u64(), data).unwrap();
+            assert_eq!(s.engine().count("t").unwrap(), 4);
+        });
+        // Fresh restart recovers snapshot + post-rotation tail.
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let cfg = ServerConfig {
+                data_dir: Some(d.clone()),
+                durability: DurabilityMode::near_sync(),
+                ..Default::default()
+            };
+            let s2 = BlitzServer::with_config(cfg);
+            s2.start().await.unwrap();
+            assert_eq!(s2.engine().count("t").unwrap(), 4);
+        });
     }
 }
