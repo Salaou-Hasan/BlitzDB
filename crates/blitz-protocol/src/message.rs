@@ -26,6 +26,10 @@ pub enum Op {
     /// `values {_col: String, _val: Value}`. Non-unique columns are rejected
     /// instead of degrading into full scans on the hot path.
     Find,
+    /// Bounded exact-term search over indexed post bodies:
+    /// `values {_q: String, _limit: Int}`. Single-node inverted index
+    /// (8 terms/post, 128/posting cap). Multi-term ANDs first two terms.
+    Search,
 }
 
 impl Op {
@@ -39,6 +43,7 @@ impl Op {
             Op::Scan => 5,
             Op::Subscribe => 6,
             Op::Find => 7,
+            Op::Search => 8,
         }
     }
 
@@ -52,6 +57,7 @@ impl Op {
             5 => Some(Op::Scan),
             6 => Some(Op::Subscribe),
             7 => Some(Op::Find),
+            8 => Some(Op::Search),
             _ => None,
         }
     }
@@ -154,11 +160,12 @@ mod tests {
             (Op::Scan, 5),
             (Op::Subscribe, 6),
             (Op::Find, 7),
+            (Op::Search, 8),
         ] {
             assert_eq!(op.tag(), tag);
             assert_eq!(Op::from_tag(tag), Some(op));
         }
-        assert_eq!(Op::from_tag(8), None);
+        assert_eq!(Op::from_tag(9), None);
         assert_eq!(Op::from_tag(255), None);
     }
 

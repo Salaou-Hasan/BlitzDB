@@ -81,6 +81,71 @@ fn take_auth_token(values: &mut Option<std::collections::HashMap<String, Value>>
     })
 }
 
+/// Stream-mode flag: `Subscribe` with `values {"_stream": 1}` upgrades the
+/// connection to server-push (one table per connection; close to stop).
+fn is_stream_subscribe(values: &Option<std::collections::HashMap<String, Value>>) -> bool {
+    match values.as_ref().and_then(|m| m.get("_stream")) {
+        Some(Value::Int64(1)) | Some(Value::UInt64(1)) | Some(Value::Int32(1)) | Some(Value::UInt32(1)) => true,
+        Some(Value::Boolean(true)) => true,
+        _ => false,
+    }
+}
+
+/// Push-stream body: ack, then one framed `Response` per change (id = change
+/// seq) until EOF, idle timeout, or lag-eviction closes the receiver.
+/// Pushes are not counted as requests (no p99 pollution); bytes are.
+/// Quiet tables hit the idle deadline — clients resubscribe (same as poll).
+async fn run_push_stream(
+    server: &Arc<BlitzServer>,
+    stream: &mut (impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin),
+    codec: &FrameCodec,
+    ack_id: u64,
+    table: String,
+    idle_secs: u64,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let (sub, mut rx) = server.push_subscribe(&table);
+    let ack = codec.encode_response(&Response::ok(ack_id, Vec::new())).context("encode error")?;
+    stream.write_all(&ack).await.context("failed to write to socket")?;
+    server.record_io(0, ack.len() as u64);
+    let idle = if idle_secs > 0 {
+        std::time::Duration::from_secs(idle_secs)
+    } else {
+        // No idle reap configured: still bound stream silence to 1h so dead
+        // peers can't pin slots forever (idle_timeout_secs=0 disables the
+        // request path, not push resources).
+        std::time::Duration::from_secs(3600)
+    };
+    loop {
+        let rec = match tokio::time::timeout(idle, rx.recv()).await {
+            Err(_) => break, // idle/quiet: client resubscribes
+            Ok(None) => break, // evicted (slow) or server gone
+            Ok(Some(r)) => r,
+        };
+        let push = Response::ok(
+            rec.seq,
+            vec![RowView {
+                id: rec.seq,
+                values: [
+                    ("table".to_string(), Value::String(rec.table.clone())),
+                    ("op".to_string(), Value::String(rec.op.to_string())),
+                    ("row_id".to_string(), Value::Int64(rec.row_id as i64)),
+                    ("ts".to_string(), Value::Int64(rec.ts_micros as i64)),
+                ]
+                .into_iter()
+                .collect(),
+            }],
+        );
+        let frame = codec.encode_response(&push).context("encode error")?;
+        server.record_io(0, frame.len() as u64);
+        if stream.write_all(&frame).await.is_err() {
+            break; // peer gone
+        }
+    }
+    server.push_unsubscribe(&table, sub);
+    Ok(())
+}
+
 /// Default/max page sizes for `Scan`. Unbounded scans are the OOM killer:
 /// one slow client scanning a 1M-row table would pin a giant `Vec<Arc>`
 /// under read lock, then a giant response frame. Pagination bounds both.
@@ -193,6 +258,16 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
                 Some(v) => v,
                 None => return Response::err(id, "insert requires values"),
             };
+            // Media blobs: bounded references, not an object store. 256KiB
+            // cap keeps frames (1MiB budget) and WAL groups healthy;
+            // transcode/CDN stay out of the hot path (Stage 10+).
+            if req.table.starts_with("media") {
+                if let Some(blitz_types::value::Value::Bytes(b)) = values.get("blob") {
+                    if b.len() > 262_144 {
+                        return Response::err(id, "blob too large (max 256KiB)");
+                    }
+                }
+            }
             // Idempotency for safe retry after shed/timeout: client sends
             // `_idem` string; stripped before storage, mapped to assigned ID.
             // Best-effort in-memory (lost on crash — within group window).
@@ -229,6 +304,17 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
                         server.idem_record(key, assigned.as_u64());
                     }
                     server.record_change(&req.table, "insert", assigned.as_u64());
+                    // Social derived state (post ack only): search index +
+                    // async fanout job. Both fire-and-forget bounded; neither
+                    // blocks the response (eventual, ~ms).
+                    if req.table.starts_with("posts") {
+                        if let Some(blitz_types::value::Value::String(body)) = values.get("body") {
+                            server.index_post(&req.table, assigned.as_u64(), body);
+                        }
+                        if let Some(blitz_types::value::Value::String(author)) = values.get("author") {
+                            server.fanout_enqueue(req.table.clone(), assigned.as_u64(), author.clone());
+                        }
+                    }
                     Response::ok(
                         id,
                         vec![RowView {
@@ -381,6 +467,37 @@ fn dispatch(server: &BlitzServer, req: Request) -> Response {
                 .collect();
             Response::ok(id, rows)
         }
+        Op::Search => {
+            use blitz_types::value::Value as V2;
+            let (q, limit) = match req.values.as_ref() {
+                Some(m) => {
+                    let q = match m.get("_q") {
+                        Some(V2::String(s)) => s.clone(),
+                        _ => return Response::err(id, "search requires values {_q: String}"),
+                    };
+                    let lim = match m.get("_limit") {
+                        Some(V2::Int64(n)) => (*n).max(0) as usize,
+                        Some(V2::UInt64(n)) => *n as usize,
+                        Some(V2::Int32(n)) => (*n).max(0) as usize,
+                        Some(V2::UInt32(n)) => *n as usize,
+                        None => 20,
+                        _ => 20,
+                    }
+                    .clamp(1, 100);
+                    (q, lim)
+                }
+                None => return Response::err(id, "search requires values {_q: String}"),
+            };
+            // Resolve postings to rows (bounded fan-out: ≤100 engine reads).
+            let mut rows = Vec::new();
+            for (table, rid) in server.search_posts(&q, limit) {
+                match server.engine().get_arc(&table, RowId::new(rid)) {
+                    Ok(Some(row)) => rows.push(row_to_view(RowId::new(rid), &row)),
+                    _ => {}
+                }
+            }
+            Response::ok(id, rows)
+        }
     }
 }
 
@@ -523,9 +640,32 @@ async fn handle_stream(
             .feed(&mut staging)
             .context("framing error: closing connection")?
         {
-            let incoming = codec
+            let mut incoming = codec
                 .decode_incoming(frame)
                 .context("decode error: closing connection")?;
+            // Push-stream upgrade: `Subscribe` with `_stream: 1` dedicates
+            // this connection to server-driven frames (DMs/live). It must be
+            // the last frame in flight; further client bytes are ignored and
+            // the connection ends when the client disconnects or goes idle.
+            // Poll-based `Subscribe` (no `_stream`) stays request/response.
+            if let Incoming::Single(ref mut req) = incoming {
+                if req.op == Op::Subscribe && is_stream_subscribe(&req.values) {
+                    if let Some(tok) = take_auth_token(&mut req.values) {
+                        if let Some(id) = server.resolve_token(&tok) {
+                            authed = Some(id);
+                        }
+                    }
+                    if let Err(e) = server.authorize(&authed, req.op, &req.table) {
+                        let rid = req.id;
+                        let err = codec.encode_response(&Response::err(rid, e)).context("encode error")?;
+                        stream.write_all(&err).await.context("failed to write to socket")?;
+                        server.record_io(0, err.len() as u64);
+                        return Ok(());
+                    }
+                    let (rid, table) = (req.id, req.table.clone());
+                    return run_push_stream(&server, &mut stream, &codec, rid, table, idle_secs).await;
+                }
+            }
             // Batch and single share one frame budget: a batch of N costs
             // one read + one write instead of N round trips.
             // Auth: `_auth` token in any op's values handshakes the
@@ -1498,6 +1638,245 @@ mod tests {
         assert!(!b.results[0].ok, "dup must fail");
         assert!(b.results[1].ok, "sibling must commit despite partial failure");
         assert_eq!(server.engine().count("users").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_push_stream_delivers_writer_insert() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+
+        // Subscriber: dedicated conn, Subscribe+_stream.
+        let sub_sock = TcpStream::connect(addr).await.unwrap();
+        sub_sock.set_nodelay(true).unwrap();
+        let (mut sub_r, mut sub_w) = sub_sock.into_split();
+        let codec = FrameCodec::with_default_limit();
+        let sub_frame = codec
+            .encode_request(&Request {
+                id: 1,
+                op: Op::Subscribe,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[("_stream", Value::Int64(1))])),
+            })
+            .unwrap();
+        sub_w.write_all(&sub_frame).await.unwrap();
+        let mut buf = BytesMut::new();
+        let ack = loop {
+            if let Some(p) = codec.feed(&mut buf).unwrap() {
+                break codec.decode_response(p).unwrap();
+            }
+            assert!(sub_r.read_buf(&mut buf).await.unwrap() > 0);
+        };
+        assert!(ack.ok && ack.id == 1 && ack.rows.is_empty(), "ack: {:?}", ack);
+
+        // Writer: normal conn inserts.
+        let mut writer = Client::connect(addr).await.unwrap();
+        let ins = writer
+            .roundtrip(&Request {
+                id: 2,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(1)),
+                    ("name", Value::String("Pushed".into())),
+                    ("email", Value::String("push@example.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(ins.ok);
+
+        // Push arrives (id = change seq, nonzero; op=insert).
+        let push = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Some(p) = codec.feed(&mut buf).unwrap() {
+                    return codec.decode_response(p).unwrap();
+                }
+                if sub_r.read_buf(&mut buf).await.unwrap() == 0 {
+                    panic!("stream closed before push");
+                }
+            }
+        })
+        .await
+        .expect("push timeout");
+        assert!(push.ok && push.id > 0, "push: {:?}", push);
+        assert_eq!(
+            push.rows[0].values.get("op"),
+            Some(&Value::String("insert".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_exact_term_bounded() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        // posts table with body for the search index.
+        server
+            .engine()
+            .create_table(
+                blitz_types::schema::TableSchema::new("posts")
+                    .with_column(blitz_types::column::ColumnDef::new("id", blitz_types::column::ColumnType::Int64).nullable())
+                    .with_column(blitz_types::column::ColumnDef::new("author", blitz_types::column::ColumnType::String).nullable())
+                    .with_column(blitz_types::column::ColumnDef::new("body", blitz_types::column::ColumnType::String).nullable()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        for (i, body) in ["hello world", "goodbye world"].iter().enumerate() {
+            let r = client
+                .roundtrip(&Request {
+                    id: i as u64,
+                    op: Op::Insert,
+                    table: "posts".into(),
+                    row_id: None,
+                    values: Some(values(&[
+                        ("author", Value::String("a".into())),
+                        ("body", Value::String((*body).into())),
+                    ])),
+                })
+                .await
+                .unwrap();
+            assert!(r.ok, "insert failed: {:?}", r.error);
+        }
+        let search = |id: u64, q: &str, lim: i64| Request {
+            id,
+            op: Op::Search,
+            table: "posts".into(),
+            row_id: None,
+            values: Some(values(&[
+                ("_q", Value::String(q.into())),
+                ("_limit", Value::Int64(lim)),
+            ])),
+        };
+        let r = client.roundtrip(&search(10, "hello", 20)).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "got {:?}", r);
+        let r = client.roundtrip(&search(11, "world", 20)).await.unwrap();
+        assert!(r.ok && r.rows.len() == 2, "got {:?}", r);
+        let r = client.roundtrip(&search(12, "world", 1)).await.unwrap();
+        assert!(r.ok && r.rows.len() == 1, "limit ignored: {:?}", r);
+        let r = client.roundtrip(&search(13, "missingterm", 20)).await.unwrap();
+        assert!(r.ok && r.rows.is_empty(), "got {:?}", r);
+    }
+
+    #[tokio::test]
+    async fn test_media_blob_cap() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        server
+            .engine()
+            .create_table(
+                blitz_types::schema::TableSchema::new("media")
+                    .with_column(blitz_types::column::ColumnDef::new("id", blitz_types::column::ColumnType::Int64).nullable())
+                    .with_column(blitz_types::column::ColumnDef::new("blob", blitz_types::column::ColumnType::Bytes).nullable()),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        // 300KiB blob → rejected before engine/WAL.
+        let r = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "media".into(),
+                row_id: None,
+                values: Some(values(&[("blob", Value::Bytes(vec![0u8; 300 * 1024]))])),
+            })
+            .await
+            .unwrap();
+        assert!(!r.ok, "oversize blob must fail");
+        // 1KiB blob → ok.
+        let r = client
+            .roundtrip(&Request {
+                id: 2,
+                op: Op::Insert,
+                table: "media".into(),
+                row_id: None,
+                values: Some(values(&[("blob", Value::Bytes(vec![0u8; 1024]))])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "small blob failed: {:?}", r.error);
+    }
+
+    #[tokio::test]
+    async fn test_fanout_materializes_follower_timeline() {
+        use crate::social::{install_fanout, run_fanout_loop};
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        for t in ["posts", "follows"] {
+            server
+                .engine()
+                .create_table(
+                    blitz_types::schema::TableSchema::new(t)
+                        .with_column(blitz_types::column::ColumnDef::new("id", blitz_types::column::ColumnType::Int64).nullable())
+                        .with_column(blitz_types::column::ColumnDef::new("author", blitz_types::column::ColumnType::String).nullable())
+                        .with_column(blitz_types::column::ColumnDef::new("body", blitz_types::column::ColumnType::String).nullable())
+                        .with_column(blitz_types::column::ColumnDef::new("from", blitz_types::column::ColumnType::String).nullable())
+                        .with_column(blitz_types::column::ColumnDef::new("to", blitz_types::column::ColumnType::String).nullable()),
+                )
+                .unwrap();
+        }
+        let rx = install_fanout(&server);
+        let s2 = Arc::clone(&server);
+        std::thread::spawn(move || run_fanout_loop(s2, rx));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        // bob follows alice.
+        let r = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::Insert,
+                table: "follows".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("from", Value::String("bob".into())),
+                    ("to", Value::String("alice".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "follow failed: {:?}", r.error);
+        // alice posts.
+        let r = client
+            .roundtrip(&Request {
+                id: 2,
+                op: Op::Insert,
+                table: "posts".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("author", Value::String("alice".into())),
+                    ("body", Value::String("hello followers".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "post failed: {:?}", r.error);
+        // Timeline row for bob appears (async, ≤5s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let rows = server.engine().scan("timeline").unwrap_or_default();
+            if rows.iter().any(|row| {
+                row.get("owner") == Some(&Value::String("bob".into()))
+                    && row.get("author") == Some(&Value::String("alice".into()))
+            }) {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "fanout never materialized");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let (done, dropped) = server.fanout_pending_approx();
+        assert!(done >= 1 && dropped == 0, "done={} dropped={}", done, dropped);
     }
 
     #[tokio::test]

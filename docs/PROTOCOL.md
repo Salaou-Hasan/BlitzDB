@@ -1,0 +1,59 @@
+# BlitzDB Wire Protocol (v2 + ops 6-8)
+
+Frame: `[ver u8][len u32 LE][payload]`, `ver = 2`, `HEADER_LEN = 5`.
+Payload kind: `0x01` Request, `0x02` BatchRequest, `0x11` Response,
+`0x12` BatchResponse. Limits: frame ≤ `max_message_size` (default 1MiB),
+batch ≤4096 ops, map ≤4096 entries, array/JSON nesting bounded — oversize
+fails the frame, never the server.
+
+## Ops (`Op` tag)
+
+| Tag | Op | Fields | Semantics |
+|---|---|---|---|
+| 0 | Ping | — | Always ok (even unauth). Carries `_auth` handshake. |
+| 1 | Insert | `table`, `values` | Validates (unless `skip_validation`), enforces unique, WAL, returns assigned id. `_idem` dedups retry. `media*` blobs ≤256KiB. |
+| 2 | Get | `table`, `row_id` | Zero-copy read. Miss → err (not empty-ok). |
+| 3 | Update | `table`, `row_id`, `values` | Returns moved row. Unique conflicts never partially apply. |
+| 4 | Delete | `table`, `row_id` | Missing → err. True deletes free unique keys. |
+| 5 | Scan | `table`, `values` window | Paginated + cursor (below). Admin/backfill pages, not hot timelines. |
+| 6 | Subscribe | `table`, `values` | Bounded long-poll (below) or `_stream:1` push upgrade. |
+| 7 | Find | `values {_col,_val}` | O(1) unique/PK lookup. Non-unique → err (never scanned). |
+| 8 | Search | `values {_q,_limit}` | Exact-term bounded postings (≤100 rows). |
+
+## Special `values` keys (all stripped before storage engine use)
+
+| Key | Ops | Meaning |
+|---|---|---|
+| `_auth` | any | Bearer token; binds identity to the connection. Stripped. |
+| `_idem` | Insert | Idempotency key → same RowId on retry. Stripped. In-memory (group-window RPO). |
+| `_limit` / `_offset` | Scan/Subscribe | Page size (Scan ≤10K, Subscribe ≤1K) / skip. |
+| `_order` | Scan | `asc` (default) / `desc`. |
+| `_cursor` | Scan | Exclusive last-seen RowId; binary-searched, stable under inserts. |
+| `_col` / `_val` | Find | Unique column + value. |
+| `_q` | Search | Query text (first two terms ANDed). |
+| `_since` | Subscribe | Only changes with `ts_micros > since`. |
+| `_stream` | Subscribe | `1` upgrades a dedicated connection to server-push (ack + seq-ID frames until EOF/idle). Must be last frame in flight. |
+
+## Batching (mandatory past ~8K active)
+
+`BatchRequest{id, ops[N]}` → `BatchResponse{id, results[N]}` in order, one
+frame = one read + one write. Per-op ok/err independent (partial failure
+normal, never atomic). Per-op latency ≈ `batch_time / N` (throughput exact).
+Recommended N = 25.
+
+## Errors (typed strings for SDK mapping)
+
+- `unauthorized: authentication required` → handshake first, then retry.
+- `forbidden: policy denies` → do not retry (fix grants).
+- `WAL backpressure...` / `group full` / `rotation in progress` → retry with
+  jitter ≤3× **with the same `_idem`**, then surface.
+- `row not found` / `not found` → do not retry blindly.
+- `blob too large`, `batch too large`, `table not found`, `DuplicateKey`,
+  type/validation errors → caller bug, don't retry.
+- Transport close/EOF/timeout → reconnect, resend with same `_idem`
+  (at-most-once without it, effectively-once with it inside the RPO).
+
+## TLS
+
+`serve_tls` speaks the identical framing post-handshake (only handshake RTT
+added). PEM cert+key via CLI. Plaintext stays for loopback/bench.

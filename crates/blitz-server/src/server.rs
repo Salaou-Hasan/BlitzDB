@@ -3,6 +3,7 @@ use blitz_auth::{Identity, Permission};
 use blitz_core::{InMemoryTableEngine, TableEngine};
 use blitz_events::{Event, EventEmitter, EventKind};
 use blitz_policy::PolicyEngine;
+use crate::social::{FanoutJob, FanoutSender};
 use blitz_protocol::Op;
 use blitz_realtime::{Delta, SubscriptionManager};
 use blitz_tx::TransactionManager;
@@ -107,11 +108,16 @@ pub struct ServerStats {
     pub bytes_read: u64,
     pub bytes_written: u64,
     /// Active transactions / conflicts / subscription fanout.
-    /// 0 today: tx/events/realtime are not on the TCP hot path yet.
-    /// Reported explicitly so SLO dashboards don't mistake missing for zero-load.
+    /// `active_tx/tx_conflicts` are 0: TCP is auto-commit (see dispatch docs).
+    /// `subscription_fanout` = push messages delivered; `push_dropped` =
+    /// slow consumers evicted.
     pub active_tx: u64,
     pub tx_conflicts: u64,
     pub subscription_fanout: u64,
+    pub push_dropped: u64,
+    /// Async timeline fanout (best-effort worker): materialized / dropped.
+    pub fanout_done: u64,
+    pub fanout_dropped: u64,
     /// WAL bytes/ops. 0 = durability `None` (in-memory). Group-commit mode
     /// will fill these; NVMe IOPS then comes from `/proc/diskstats`.
     pub wal_bytes: u64,
@@ -141,6 +147,10 @@ pub struct BlitzServer {
     wal_dropped_full: std::sync::atomic::AtomicU64,
     wal: RwLock<Option<crate::durability::WalCluster>>,
     wal_rotating: AtomicBool,
+    /// Set when a WAL cluster is installed. Lets `wal_log` skip the map
+    /// lock + 16-sender clone entirely in `None` mode (that clone cost
+    /// ~30% throughput at 50K batch once shards landed).
+    wal_enabled: AtomicBool,
     /// Idempotency dedup: client `_idem` key → assigned RowId.
     /// Bounded (256K, clears half when full); safe-retry for shed/timeout.
     idem: RwLock<HashMap<String, u64>>,
@@ -153,6 +163,18 @@ pub struct BlitzServer {
     /// false, so write-only workloads (benches, cache shards) pay zero
     /// change-log cost (no clock read, no map lock).
     changes_used: AtomicBool,
+    /// Push subscribers per table: (sub_id, sender). Bounded 64-deep
+    /// channels; slow consumers are dropped + counted, never blocking writers.
+    push_hub: RwLock<HashMap<String, Vec<(u64, tokio::sync::mpsc::Sender<ChangeRecord>)>>>,
+    push_used: AtomicBool,
+    push_dropped: std::sync::atomic::AtomicU64,
+    push_delivered: std::sync::atomic::AtomicU64,
+    /// Exact-term search postings: term → [(table, row_id)] (cap 128/term).
+    search_index: RwLock<HashMap<String, std::sync::Arc<std::sync::Mutex<VecDeque<(String, u64)>>>>>,
+    /// Async fanout ingress (set by `install_fanout_channel`; None = off).
+    fanout_tx: RwLock<Option<FanoutSender>>,
+    fanout_done: std::sync::atomic::AtomicU64,
+    fanout_dropped: std::sync::atomic::AtomicU64,
 }
 
 impl BlitzServer {
@@ -177,11 +199,20 @@ impl BlitzServer {
             wal_dropped_full: std::sync::atomic::AtomicU64::new(0),
             wal: RwLock::new(None),
             wal_rotating: AtomicBool::new(false),
+            wal_enabled: AtomicBool::new(false),
             idem: RwLock::new(HashMap::new()),
             ips: std::sync::Mutex::new(HashMap::new()),
             changes: RwLock::new(HashMap::new()),
             change_seq: std::sync::atomic::AtomicU64::new(1),
             changes_used: AtomicBool::new(false),
+            push_hub: RwLock::new(HashMap::new()),
+            push_used: AtomicBool::new(false),
+            push_dropped: std::sync::atomic::AtomicU64::new(0),
+            push_delivered: std::sync::atomic::AtomicU64::new(0),
+            search_index: RwLock::new(HashMap::new()),
+            fanout_tx: RwLock::new(None),
+            fanout_done: std::sync::atomic::AtomicU64::new(0),
+            fanout_dropped: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -320,7 +351,10 @@ impl BlitzServer {
             bytes_written: self.bytes_written.load(O::Relaxed),
             active_tx: 0,
             tx_conflicts: 0,
-            subscription_fanout: 0,
+            subscription_fanout: self.push_delivered.load(O::Relaxed),
+            push_dropped: self.push_dropped.load(O::Relaxed),
+            fanout_done: self.fanout_done.load(O::Relaxed),
+            fanout_dropped: self.fanout_dropped.load(O::Relaxed),
             wal_bytes,
             wal_ops,
         }
@@ -348,6 +382,11 @@ impl BlitzServer {
         data: Vec<u8>,
     ) -> Result<(), String> {
         use std::sync::atomic::Ordering as O;
+        // Fast path: single atomic load, no lock, no clone. All benches and
+        // cache shards run here.
+        if !self.wal_enabled.load(O::Relaxed) {
+            return Ok(());
+        }
         if self.wal_rotating.load(O::Relaxed) {
             self.wal_dropped_full.fetch_add(1, O::Relaxed);
             return Err("WAL rotation in progress".to_string());
@@ -410,6 +449,7 @@ impl BlitzServer {
             let cluster = crate::durability::WalCluster::open(&dir, self.config.durability)?;
             if cluster.is_enabled() {
                 *self.wal.write().unwrap() = Some(cluster);
+                self.wal_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
         self.wal_rotating.store(false, O::Relaxed);
@@ -497,7 +537,7 @@ impl BlitzServer {
         }
         let perm: Permission = match op {
             Op::Insert | Op::Update => Permission::Write,
-            Op::Get | Op::Scan | Op::Find | Op::Subscribe => Permission::Read,
+            Op::Get | Op::Scan | Op::Find | Op::Subscribe | Op::Search => Permission::Read,
             Op::Delete => Permission::Delete,
             Op::Ping => return Ok(()),
         };
@@ -539,11 +579,42 @@ impl BlitzServer {
             }
         };
         if let Ok(mut q) = deque.lock() {
-            q.push_back(rec);
+            q.push_back(rec.clone());
             while q.len() > MAX_CHANGES_PER_TABLE {
                 q.pop_front();
             }
         };
+        // Push fanout to stream subscribers (bounded; evict slow readers).
+        if self.push_used.load(O::Relaxed) {
+            let targets: Vec<(u64, tokio::sync::mpsc::Sender<ChangeRecord>)> = self
+                .push_hub
+                .read()
+                .ok()
+                .and_then(|h| h.get(table).cloned())
+                .unwrap_or_default();
+            if !targets.is_empty() {
+                let mut dead = Vec::new();
+                let mut delivered = 0u64;
+                for (id, tx) in &targets {
+                    if tx.try_send(rec.clone()).is_err() {
+                        dead.push(*id);
+                    } else {
+                        delivered += 1;
+                    }
+                }
+                if delivered > 0 {
+                    self.push_delivered.fetch_add(delivered, O::Relaxed);
+                }
+                if !dead.is_empty() {
+                    self.push_dropped.fetch_add(dead.len() as u64, O::Relaxed);
+                    if let Ok(mut hub) = self.push_hub.write() {
+                        if let Some(v) = hub.get_mut(table) {
+                            v.retain(|(id, _)| !dead.contains(id));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Read changes for `table` with `ts_micros > since`, oldest first,
@@ -552,13 +623,130 @@ impl BlitzServer {
         use std::sync::atomic::Ordering as O;
         self.changes_used.store(true, O::Relaxed);
         let limit = limit.clamp(1, 1000);
-        let limit = limit.clamp(1, 1000);
         match self.changes.read().ok().and_then(|m| m.get(table).cloned()) {
             Some(d) => match d.lock() {
                 Ok(q) => q.iter().filter(|r| r.ts_micros > since).take(limit).cloned().collect(),
                 Err(_) => Vec::new(),
             },
             None => Vec::new(),
+        }
+    }
+
+    /// Index a post body for exact-term `Search` (call after acked insert
+    /// into a `posts*` table). Tokenizes ≤8 terms; postings capped 128/term.
+    pub fn index_post(&self, table: &str, row_id: u64, body: &str) {
+        for term in crate::social::tokenize(body).into_iter().take(8) {
+            let deque = {
+                match self.search_index.read().ok().and_then(|m| m.get(&term).cloned()) {
+                    Some(d) => d,
+                    None => {
+                        let d = std::sync::Arc::new(std::sync::Mutex::new(VecDeque::new()));
+                        if let Ok(mut m) = self.search_index.write() {
+                            m.entry(term.clone()).or_insert_with(|| std::sync::Arc::clone(&d));
+                        }
+                        d
+                    }
+                }
+            };
+            if let Ok(mut q) = deque.lock() {
+                // Refresh recency: drop existing same posting first.
+                q.retain(|(t, r)| !(t == table && *r == row_id));
+                q.push_back((table.to_string(), row_id));
+                while q.len() > 128 {
+                    q.pop_front();
+                }
+            };
+        }
+    }
+
+    /// Exact-term search: postings of the first query term, ANDed with the
+    /// second when present. Returns up to `limit` (table, row_id) newest-last.
+    pub fn search_posts(&self, query: &str, limit: usize) -> Vec<(String, u64)> {
+        let limit = limit.clamp(1, 100).max(1);
+        let terms = crate::social::tokenize(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let postings = |t: &str| -> Vec<(String, u64)> {
+            self.search_index
+                .read()
+                .ok()
+                .and_then(|m| m.get(t).cloned())
+                .and_then(|d| d.lock().ok().map(|q| q.iter().cloned().collect()))
+                .unwrap_or_default()
+        };
+        let mut hits = postings(&terms[0]);
+        if terms.len() > 1 {
+            use std::collections::HashSet;
+            let second: HashSet<(String, u64)> = postings(&terms[1]).into_iter().collect();
+            hits.retain(|h| second.contains(h));
+        }
+        // Newest-last insertion order; take the tail.
+        if hits.len() > limit {
+            hits[hits.len() - limit..].to_vec()
+        } else {
+            hits
+        }
+    }
+
+    /// Install the fanout ingress channel (called once by whoever spawns
+    /// `social::run_fanout_loop`). Dispatch enqueues post jobs best-effort.
+    pub fn install_fanout_channel(&self, sender: FanoutSender) {
+        if let Ok(mut g) = self.fanout_tx.write() {
+            *g = Some(sender);
+        }
+    }
+
+    /// Enqueue a post for async fanout. Fire-and-forget: full queue drops +
+    /// counts (reader falls back to pull). ~50ns when worker installed, one
+    /// lock read + try_send when not (None → immediate Ok).
+    pub fn fanout_enqueue(&self, table: String, row_id: u64, author: String) {
+        use std::sync::atomic::Ordering as O;
+        let sender = match self.fanout_tx.read().ok().and_then(|g| (*g).clone()) {
+            Some(s) => s,
+            None => return,
+        };
+        if sender
+            .tx
+            .try_send(FanoutJob { table, row_id, author })
+            .is_err()
+        {
+            self.fanout_dropped.fetch_add(1, O::Relaxed);
+        }
+    }
+
+    pub fn fanout_record_done(&self, n: u64) {
+        use std::sync::atomic::Ordering as O;
+        if n > 0 {
+            self.fanout_done.fetch_add(n, O::Relaxed);
+        }
+    }
+
+    pub fn fanout_pending_approx(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering as O;
+        (self.fanout_done.load(O::Relaxed), self.fanout_dropped.load(O::Relaxed))
+    }
+
+    /// Register a push subscriber for `table`. Returns sub id + receiver.
+    /// Arms realtime (change-log + hub). Bounded 64-deep; slow consumers are
+    /// evicted on next publish, never blocking writers.
+    pub fn push_subscribe(&self, table: &str) -> (u64, tokio::sync::mpsc::Receiver<ChangeRecord>) {
+        use std::sync::atomic::Ordering as O;
+        self.changes_used.store(true, O::Relaxed);
+        self.push_used.store(true, O::Relaxed);
+        let sub = self.change_seq.fetch_add(1, O::Relaxed);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        if let Ok(mut hub) = self.push_hub.write() {
+            hub.entry(table.to_string()).or_default().push((sub, tx));
+        }
+        (sub, rx)
+    }
+
+    pub fn push_unsubscribe(&self, table: &str, sub: u64) {
+        if let Ok(mut hub) = self.push_hub.write() {
+            if let Some(v) = hub.get_mut(table) {
+                v.retain(|(id, _)| *id != sub);
+            }
         }
     }
 
@@ -579,11 +767,16 @@ impl BlitzServer {
              # HELP blitz_wal_bytes_total WAL bytes fsynced\n# TYPE blitz_wal_bytes_total counter\nblitz_wal_bytes_total {}\n\
              # HELP blitz_wal_ops_total WAL ops fsynced\n# TYPE blitz_wal_ops_total counter\nblitz_wal_ops_total {}\n\
              # HELP blitz_active_tx active transactions (0: auto-commit TCP)\n# TYPE blitz_active_tx gauge\nblitz_active_tx {}\n\
+             # HELP blitz_push_delivered_total stream pushes delivered\n# TYPE blitz_push_delivered_total counter\nblitz_push_delivered_total {}\n\
+             # HELP blitz_push_dropped_total slow push consumers evicted\n# TYPE blitz_push_dropped_total counter\nblitz_push_dropped_total {}\n\
+             # HELP blitz_fanout_done_total timeline rows materialized\n# TYPE blitz_fanout_done_total counter\nblitz_fanout_done_total {}\n\
+             # HELP blitz_fanout_dropped_total fanout jobs shed under pressure\n# TYPE blitz_fanout_dropped_total counter\nblitz_fanout_dropped_total {}\n\
              # HELP blitz_uptime_seconds server uptime\n# TYPE blitz_uptime_seconds gauge\nblitz_uptime_seconds {:.1}\n",
             s.connections, s.total_requests, s.slow_responses, slow,
             s.shed_drops, self.wal_dropped(),
             s.bytes_read, s.bytes_written, s.wal_bytes, s.wal_ops,
-            s.active_tx, uptime,
+            s.active_tx, s.subscription_fanout, s.push_dropped,
+            s.fanout_done, s.fanout_dropped, uptime,
         )
     }
 
@@ -622,6 +815,7 @@ impl BlitzServer {
                 )?;
                 if cluster.is_enabled() {
                     *self.wal.write().unwrap() = Some(cluster);
+                    self.wal_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }

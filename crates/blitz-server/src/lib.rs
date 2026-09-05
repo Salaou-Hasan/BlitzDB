@@ -1,6 +1,7 @@
 pub mod bench_common;
 pub mod durability;
 pub mod server;
+pub mod social;
 pub mod transport;
 
 pub use durability::DurabilityMode;

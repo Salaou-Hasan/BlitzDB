@@ -503,6 +503,48 @@ mod tests {
     }
 
     #[test]
+    fn test_concurrent_distinct_rows_and_unique_race() {
+        use std::sync::Arc as StdArc;
+        let engine = StdArc::new(InMemoryTableEngine::new());
+        engine.create_table(test_schema()).unwrap();
+        for i in 0..200 {
+            engine.insert("users", make_row(i, &format!("U{}", i))).unwrap();
+        }
+        // 16 threads × updates (overlapping rows are fine: same-row
+        // concurrent updates are all valid when no unique columns change).
+        std::thread::scope(|s| {
+            for t in 0..16 {
+                let e = StdArc::clone(&engine);
+                s.spawn(move || {
+                    for k in 0..50 {
+                        let rid = RowId::new(1 + ((t * 50 + k) % 200) as u64);
+                        let mut u = HashMap::new();
+                        u.insert("name".into(), Value::String(format!("T{}K{}", t, k)));
+                        let _ = e.update("users", rid, u);
+                    }
+                });
+            }
+        });
+        assert_eq!(engine.count("users").unwrap(), 200);
+        // Concurrent duplicate-email inserts: exactly one wins.
+        let results: Vec<_> = std::thread::scope(|s| {
+            let mut hs = Vec::new();
+            for t in 0..16 {
+                let e = StdArc::clone(&engine);
+                hs.push(s.spawn(move || {
+                    let mut row = Row::new(RowId::new(0));
+                    row.set("id", Value::Int64(1000 + t));
+                    row.set("name", Value::String(format!("R{}", t)));
+                    row.set("email", Value::String("race@example.com".into()));
+                    e.insert("users", row).is_ok()
+                }));
+            }
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(results.iter().filter(|&&x| x).count(), 1, "exactly one duplicate claimant wins");
+    }
+
+    #[test]
     fn test_scan() {
         let engine = InMemoryTableEngine::new();
         engine.create_table(test_schema()).unwrap();
