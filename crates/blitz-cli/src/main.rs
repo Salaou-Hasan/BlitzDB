@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 mod compat;
 mod dev;
 mod generate;
+mod install;
 
 #[derive(Parser)]
 #[command(
@@ -138,6 +139,30 @@ enum Commands {
 
     /// Show performance metrics
     Metrics,
+
+    /// Download a prebuilt server binary for this device (OS/arch
+    /// detected; checksums verified). Versions: `latest`, `vX.Y.Z`,
+    /// or `X.Y.Z`. Installs to ~/.blitzdb/bin by default.
+    Install {
+        /// Release to install: `latest`, `vX.Y.Z`, or `X.Y.Z` (default: latest)
+        #[arg(default_value = "latest")]
+        release: String,
+
+        /// Install directory (default: ~/.blitzdb/bin)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+
+        /// Replace an existing install
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Upgrade the server binary to the latest release.
+    Upgrade {
+        /// Install directory (default: ~/.blitzdb/bin)
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
 
     /// Generate deterministic bindings from blitz/schema + blitz/functions.
     /// Writes blitz.generated/ (ts/ + rs/ + manifest.json). `--check`
@@ -408,6 +433,20 @@ async fn main() -> Result<()> {
                 procedures: procedures.map(PathBuf::from),
             })
             .await?;
+        }
+
+        Commands::Install { release, dir, force } => {
+            let dest = install::run_install(install::InstallArgs { version: release, dir, force })?;
+            println!("binary ready: {}", dest.display());
+        }
+
+        Commands::Upgrade { dir } => {
+            let dest = install::run_install(install::InstallArgs {
+                version: "latest".to_string(),
+                dir,
+                force: true,
+            })?;
+            println!("upgraded: {}", dest.display());
         }
 
         Commands::Metrics => {

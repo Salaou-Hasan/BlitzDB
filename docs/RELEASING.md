@@ -42,3 +42,18 @@ Each release provides the three `blitz-*` binaries, `SHA256SUMS`, and
 notes. SDKs check `Op::Version` at connect and fail fast on skew
 (see `docs/COMPATIBILITY.md`) — a stale client against a new server is
 a readable error, never silent corruption.
+
+## Installing a release
+
+```bash
+blitz install            # latest for THIS device (detected)
+blitz install v0.2.1     # pinned (checksums verified, +x set)
+blitz upgrade            # latest, replacing the current install
+```
+
+Devices map 1:1 to assets (`linux/x86_64`, `windows/x86_64`,
+`macos/aarch64`); anything else errors with the supported list.
+Manual equivalent per device: download the asset +
+`SHA256SUMS` from the release page, verify
+`sha256sum -c` (Linux) / `shasum -a 256` (macOS) /
+`Get-FileHash` (Windows), then run it.
