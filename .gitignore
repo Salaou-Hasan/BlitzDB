@@ -1,2 +1,4 @@
 /target
-Cargo.lock
+# NOTE: Cargo.lock is COMMITTED (binary-shipping workspace — reproducible
+# builds and --locked CI demand it; the library-only convention of
+# ignoring it does not apply).
