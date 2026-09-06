@@ -28,7 +28,7 @@ from .errors import SdkError, map_server_error
 
 DEFAULT_TIMEOUT = 5.0
 
-CLIENT_VERSION = "0.2.0"
+CLIENT_VERSION = "0.2.1"
 MIN_SERVER_VERSION = "0.1.0"
 PROTOCOL_VERSION_PY = 2
 
