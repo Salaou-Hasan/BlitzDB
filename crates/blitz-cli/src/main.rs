@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 mod compat;
 mod dev;
+mod generate;
 
 #[derive(Parser)]
 #[command(
@@ -138,6 +139,19 @@ enum Commands {
     /// Show performance metrics
     Metrics,
 
+    /// Generate deterministic bindings from blitz/schema + blitz/functions.
+    /// Writes blitz.generated/ (ts/ + rs/ + manifest.json). `--check`
+    /// fails when output differs (CI mode). Reproducible: reruns are
+    /// byte-identical.
+    Generate {
+        /// Project directory (default: current dir)
+        #[arg(default_value = ".")]
+        dir: String,
+
+        /// Only verify output is current (do not write)
+        #[arg(long)]
+        check: bool,
+    },
     /// Local development: server + HTTP bridge + procedure hot-reload.
     /// Watches <dir>/procedures/*.json deploy envelopes and redeploys
     /// on save. In-memory dev defaults; Ctrl-C stops.
@@ -400,6 +414,13 @@ async fn main() -> Result<()> {
             server.start().await?;
             // Real stats, Prometheus exposition (single-node industry std).
             print!("{}", server.metrics_text());
+        }
+
+        Commands::Generate { dir, check } => {
+            generate::run_generate(&generate::GenerateArgs {
+                project: PathBuf::from(dir),
+                check,
+            })?;
         }
     }
 
