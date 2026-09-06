@@ -145,6 +145,19 @@ Deploy validated procedures over TCP; calls always run the latest version:
   Rejected inside atomic batches (registry mutation can't roll back).
   HTTP bridge: `proc_deploy` / `proc_list` / `proc_drop`.
 
+## HTTP transport notes (templates)
+
+- CORS: `http_cors_origins` config (`["*"]` or explicit origins); empty
+  means no CORS headers (same-origin/curl only). Preflight (`OPTIONS`)
+  answered without auth.
+- Keep-alive: HTTP/1.1 persistent by default (1.0 opt-in via
+  `Connection: keep-alive`); up to 10K requests per connection.
+- `GET /v1/stream?table=X&since=N[&token=]`: SSE change stream
+  (`text/event-stream`, `data:` JSON per record, `: connected` hello,
+  250ms poll cadence). Auth like `Subscribe`; `?token=` fallback exists
+  because `EventSource` can't set headers. Row-owner tables stay off
+  push/SSE (poll instead). Ends on client disconnect.
+
 ## Auth sessions + row ownership
 
 - Sessions: `register_session(token, identity, ttl_secs)` mints short-lived

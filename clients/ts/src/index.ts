@@ -11,6 +11,8 @@
 
 export { Client, MAX_FLUSH_OPS, FLUSH_CHUNK } from './client.ts';
 export type { CallResult, ClientOptions } from './client.ts';
+export { HttpClient } from './http.ts';
+export type { HttpCallResult, HttpOptions } from './http.ts';
 export { SdkError, mapServerError } from './errors.ts';
 export type { SdkErrorKind } from './errors.ts';
 export { FrameCodec, PROTOCOL_VERSION, DEFAULT_MAX_FRAME } from './codec.ts';

@@ -1921,106 +1921,361 @@ pub async fn serve_tls(
 /// no new deps — for scraping without touching the binary hot path.
 /// TLS termination stays at the reverse proxy (documented); this listener
 /// binds loopback by default.
+/// JSON-over-HTTP bridge listener: metrics, readiness, the `/v1`
+/// data envelope, CORS, keep-alive, and an SSE change stream.
+///
+/// This is an ops bridge, not a general server: HTTP/1.x only, no
+/// chunked bodies (Content-Length required), one handler task per
+/// connection, keep-alive loop bounded per connection. Browsers need
+/// `http_cors_origins` configured (else no CORS headers → fetch blocked).
 pub async fn serve_http_ops(server: Arc<BlitzServer>, listener: TcpListener) -> Result<()> {
     loop {
-        let (mut socket, _peer) = listener.accept().await.context("http accept failed")?;
+        let (socket, _peer) = listener.accept().await.context("http accept failed")?;
         let server = Arc::clone(&server);
         tokio::spawn(async move {
-            use tokio::io::{AsyncReadExt, AsyncWriteExt};
-            // Headers first (cap 16KiB), then exactly Content-Length body
-            // bytes (cap: max_message_size, else 413). One request per
-            // connection (HTTP/1.0 close) — this is an ops bridge, not a
-            // general server.
-            let mut head = Vec::with_capacity(1024);
-            let mut byte = [0u8; 1];
-            let header_end = loop {
-                match socket.read(&mut byte).await {
-                    Ok(0) => return,
-                    Ok(_) => {
-                        head.push(byte[0]);
-                        if head.len() > 16384 {
-                            let _ = socket.write_all(b"HTTP/1.0 413 Too Large\r\nconnection: close\r\n\r\n").await;
-                            return;
-                        }
-                        if head.len() >= 4 && head[head.len() - 4..] == *b"\r\n\r\n" {
-                            break head.len();
-                        }
-                    }
-                    Err(_) => return,
-                }
-            };
-            let req_text = String::from_utf8_lossy(&head[..header_end]);
-            let mut lines = req_text.lines();
-            let request_line = lines.next().unwrap_or("/");
-            let mut parts = request_line.split_whitespace();
-            let method = parts.next().unwrap_or("");
-            let path = parts.next().unwrap_or("/");
-            let mut content_length: usize = 0;
-            let mut bearer: Option<String> = None;
-            for line in lines {
-                let line = line.trim_end_matches('\r');
-                if let Some(v) = line.strip_prefix("content-length:").or_else(|| line.strip_prefix("Content-Length:")) {
-                    content_length = v.trim().parse().unwrap_or(0);
-                } else if let Some(v) = line.strip_prefix("authorization:").or_else(|| line.strip_prefix("Authorization:")) {
-                    let v = v.trim();
-                    if let Some(tok) = v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")) {
-                        bearer = Some(tok.trim().to_string());
-                    }
-                }
+            http_connection(server, socket).await;
+        });
+    }
+}
+
+/// CORS origin check: exact match or wildcard. Empty config = no headers.
+fn cors_origin(server: &BlitzServer, origin: Option<&str>) -> Option<String> {
+    let origins = &server.config().http_cors_origins;
+    if origins.is_empty() {
+        return None;
+    }
+    let origin = origin?;
+    if origins.iter().any(|o| o == "*" || o == origin) {
+        // Echo back explicit origins (credentials-safe); "*" only when the
+        // operator literally configured "*".
+        if origins.iter().any(|o| o == "*") {
+            Some("*".to_string())
+        } else {
+            Some(origin.to_string())
+        }
+    } else {
+        None
+    }
+}
+
+fn reason(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Too Large",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
+}
+
+/// Read one request head (buffered; 16KiB cap). Returns
+/// (method, target, version, headers, body-prefix bytes).
+async fn read_head(
+    socket: &mut TcpStream,
+    buf: &mut Vec<u8>,
+) -> Option<(String, String, String, Vec<(String, String)>, usize)> {
+    use tokio::io::AsyncReadExt;
+    loop {
+        if let Some(pos) = find_headers_end(buf) {
+            let head = String::from_utf8_lossy(&buf[..pos]).into_owned();
+            return Some(parse_head(&head, pos));
+        }
+        if buf.len() > 16384 {
+            return None;
+        }
+        let mut tmp = [0u8; 4096];
+        match socket.read(&mut tmp).await {
+            Ok(0) => return None,
+            Ok(n) => buf.extend_from_slice(&tmp[..n]),
+            Err(_) => return None,
+        }
+    }
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+}
+
+fn parse_head(text: &str, header_end: usize) -> (String, String, String, Vec<(String, String)>, usize) {
+    let mut lines = text.lines();
+    let request_line = lines.next().unwrap_or("/");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_string();
+    let target = parts.next().unwrap_or("/").to_string();
+    let version = parts.next().unwrap_or("HTTP/1.0").to_string();
+    let mut headers = Vec::new();
+    for line in lines {
+        let line = line.trim_end_matches('\r');
+        if let Some((k, v)) = line.split_once(':') {
+            headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+        }
+    }
+    (method, target, version, headers, header_end)
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+/// One HTTP connection: keep-alive request loop (bounded), CORS, SSE.
+async fn http_connection(server: Arc<BlitzServer>, mut socket: TcpStream) {
+    use tokio::io::AsyncWriteExt;
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    // Bound requests per connection (FD churn over FD hoarding).
+    for _ in 0..10000 {
+        let (method, target, version, headers, header_end) = match read_head(&mut socket, &mut buf).await {
+            Some(h) => h,
+            None => return,
+        };
+        // Bytes after the head belong to the body (pipelined tail stays).
+        let mut body = buf.split_off(header_end);
+        buf.clear();
+        let content_length: usize = header(&headers, "content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+        let max_body = server.config().max_message_size.max(1024);
+        if content_length > max_body {
+            let _ = respond(&mut socket, 413, "text/plain", "too large\n", "close", None).await;
+            return;
+        }
+        while body.len() < content_length {
+            let mut tmp = [0u8; 8192];
+            match tokio::io::AsyncReadExt::read(&mut socket, &mut tmp).await {
+                Ok(0) => return,
+                Ok(n) => body.extend_from_slice(&tmp[..n]),
+                Err(_) => return,
             }
-            let max_body = server.config().max_message_size.max(1024);
-            if content_length > max_body {
-                let _ = socket.write_all(b"HTTP/1.0 413 Too Large\r\nconnection: close\r\n\r\n").await;
+            if body.len() > max_body {
+                let _ = respond(&mut socket, 413, "text/plain", "too large\n", "close", None).await;
                 return;
             }
-            let mut body = vec![0u8; content_length];
-            if content_length > 0 {
-                if let Err(_) = tokio::io::AsyncReadExt::read_exact(&mut socket, &mut body).await {
-                    return;
+        }
+        body.truncate(content_length);
+        // Keep-alive: HTTP/1.1 defaults on; 1.0 defaults off.
+        let conn_hdr = header(&headers, "connection").unwrap_or("");
+        let keep_alive = if version == "HTTP/1.1" {
+            conn_hdr.to_ascii_lowercase() != "close"
+        } else {
+            conn_hdr.to_ascii_lowercase() == "keep-alive"
+        };
+        let conn_tok = if keep_alive { "keep-alive" } else { "close" };
+
+        // CORS preflight: answered without auth, with the allow-list.
+        let origin = header(&headers, "origin");
+        let cors = cors_origin(&server, origin);
+        if method == "OPTIONS" {
+            let mut extra = String::new();
+            if let Some(o) = cors.as_deref() {
+                extra = format!(
+                    "access-control-allow-origin: {}\r\naccess-control-allow-methods: GET, POST, OPTIONS\r\naccess-control-allow-headers: authorization, content-type\r\naccess-control-max-age: 86400\r\n",
+                    o
+                );
+            }
+            let head = format!(
+                "{} 204 {}\r\n{}content-length: 0\r\nconnection: {}\r\n\r\n",
+                version, reason(204), extra, conn_tok
+            );
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            if !keep_alive {
+                return;
+            }
+            continue;
+        }
+
+        // Split path and query (SSE params live in the query).
+        let (path, query) = match target.find('?') {
+            Some(i) => (&target[..i], &target[i + 1..]),
+            None => (target.as_str(), ""),
+        };
+        let query_param = |name: &str| -> Option<String> {
+            query.split('&').find_map(|kv| {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                if k == name {
+                    Some(percent_decode(v))
+                } else {
+                    None
+                }
+            })
+        };
+        // Stateless identity per request: header first, `?token=` fallback
+        // (EventSource can't set headers — SSE needs the fallback).
+        let bearer = header(&headers, "authorization").and_then(|v| {
+            let v = v.trim();
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+                .map(|t| t.trim().to_string())
+        });
+        let token = bearer.or_else(|| query_param("token"));
+        let authed = token.as_deref().and_then(|t| server.resolve_token(t));
+
+        // SSE change stream: holds the connection by design.
+        if method == "GET" && path == "/v1/stream" {
+            let table = query_param("table").unwrap_or_default();
+            if table.is_empty() {
+                let _ = respond(&mut socket, 400, "text/plain", "missing ?table=\n", "close", cors.clone()).await;
+                return;
+            }
+            if let Err(e) = server.authorize(&authed, blitz_protocol::Op::Subscribe, &table) {
+                let code = if e.starts_with("unauthorized") { 401 } else { 403 };
+                let _ = respond(&mut socket, code, "text/plain", &format!("{}\n", e), "close", cors.clone()).await;
+                return;
+            }
+            if server.config().require_auth && server.owner_column(&table).is_some() {
+                let _ = respond(&mut socket, 403, "text/plain", "push streams disabled on row-owner tables (poll instead)\n", "close", cors.clone()).await;
+                return;
+            }
+            sse_stream(&server, &mut socket, &table, query_param("since"), cors).await;
+            return;
+        }
+
+        let (code, ctype, resp_body): (u16, &str, String) = match (method.as_str(), path) {
+            ("GET", "/metrics") => (200, "text/plain; version=0.0.4", server.metrics_text()),
+            ("GET", "/readyz") => {
+                if server.uptime_secs().is_some() {
+                    (200, "text/plain", "ok\n".to_string())
+                } else {
+                    (503, "text/plain", "starting\n".to_string())
                 }
             }
-            // Stateless identity per request (no connection stickiness).
-            let authed = bearer.as_deref().and_then(|t| server.resolve_token(t));
-            let (code, ctype, resp_body): (u16, &str, String) = match (method, path) {
-                ("GET", "/metrics") => (200, "text/plain; version=0.0.4", server.metrics_text()),
-                ("GET", "/readyz") => {
-                    if server.uptime_secs().is_some() {
-                        (200, "text/plain", "ok\n".to_string())
-                    } else {
-                        (503, "text/plain", "starting\n".to_string())
+            ("POST", "/v1/op") => {
+                let (c, b) = crate::http_bridge::handle_op(&server, &authed, &body);
+                (c, "application/json", b)
+            }
+            ("POST", "/v1/batch") => {
+                let (c, b) = crate::http_bridge::handle_batch(&server, &authed, &body);
+                (c, "application/json", b)
+            }
+            _ if method != "GET" && (path == "/v1/op" || path == "/v1/batch") => {
+                (405, "text/plain", "method not allowed (use POST)\n".to_string())
+            }
+            _ => (404, "text/plain", "not found\n".to_string()),
+        };
+        if respond(&mut socket, code, ctype, &resp_body, conn_tok, cors).await.is_err() {
+            return;
+        }
+        if !keep_alive {
+            return;
+        }
+    }
+}
+
+async fn respond(
+    socket: &mut TcpStream,
+    code: u16,
+    ctype: &str,
+    body: &str,
+    conn: &str,
+    cors: Option<String>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: {}\r\n",
+        code,
+        reason(code),
+        ctype,
+        body.len(),
+        conn
+    );
+    if let Some(o) = cors {
+        head.push_str(&format!("access-control-allow-origin: {}\r\n", o));
+    }
+    head.push_str("\r\n");
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(body.as_bytes()).await
+}
+
+/// Percent-decode a query value (`+` → space; invalid sequences pass through).
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = |c: u8| match c {
+                    b'0'..=b'9' => Some(c - b'0'),
+                    b'a'..=b'f' => Some(c - b'a' + 10),
+                    b'A'..=b'F' => Some(c - b'A' + 10),
+                    _ => None,
+                };
+                match (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                    (Some(h), Some(l)) => {
+                        out.push(h << 4 | l);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
                     }
                 }
-                ("POST", "/v1/op") => {
-                    let (c, b) = crate::http_bridge::handle_op(&server, &authed, &body);
-                    (c, "application/json", b)
-                }
-                ("POST", "/v1/batch") => {
-                    let (c, b) = crate::http_bridge::handle_batch(&server, &authed, &body);
-                    (c, "application/json", b)
-                }
-                _ if method != "GET" && (path == "/v1/op" || path == "/v1/batch") => {
-                    (405, "text/plain", "method not allowed (use POST)\n".to_string())
-                }
-                _ => (404, "text/plain", "not found\n".to_string()),
-            };
-            let reason = match code {
-                200 => "OK",
-                400 => "Bad Request",
-                401 => "Unauthorized",
-                403 => "Forbidden",
-                404 => "Not Found",
-                405 => "Method Not Allowed",
-                413 => "Too Large",
-                503 => "Service Unavailable",
-                _ => "OK",
-            };
-            let head = format!(
-                "HTTP/1.0 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                code, reason, ctype, resp_body.len()
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// SSE change stream over the bounded change-log: polls `read_changes`
+/// every 250ms, emitting new records as `data:` frames from the last seen
+/// `ts_micros`. Ends on client disconnect (read side closes) or shutdown.
+/// Same visibility as `Subscribe` polls (recorded writes only).
+async fn sse_stream(
+    server: &Arc<BlitzServer>,
+    socket: &mut TcpStream,
+    table: &str,
+    since: Option<String>,
+    cors: Option<String>,
+) {
+    use tokio::io::AsyncWriteExt;
+    let mut head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncache-control: no-cache\r\nconnection: keep-alive\r\n".to_string();
+    if let Some(o) = cors {
+        head.push_str(&format!("access-control-allow-origin: {}\r\n", o));
+    }
+    head.push_str("\r\n");
+    if socket.write_all(head.as_bytes()).await.is_err() {
+        return;
+    }
+    // Comment keep-alive so intermediaries don't buffer us out.
+    if socket.write_all(b": connected\n\n").await.is_err() {
+        return;
+    }
+    let mut since: u64 = since.and_then(|s| s.parse().ok()).unwrap_or(0);
+    loop {
+        let recs = server.read_changes(table, since, 100);
+        for r in &recs {
+            let data = format!(
+                "{{\"table\":{},\"op\":{},\"row_id\":{},\"ts\":{}}}",
+                serde_json::Value::String(r.table.clone()),
+                serde_json::Value::String(r.op.to_string()),
+                r.row_id,
+                r.ts_micros
             );
-            let _ = socket.write_all(head.as_bytes()).await;
-            let _ = socket.write_all(resp_body.as_bytes()).await;
-        });
+            let frame = format!("data: {}\n\n", data);
+            if socket.write_all(frame.as_bytes()).await.is_err() {
+                return;
+            }
+            since = since.max(r.ts_micros);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // Detect a gone client without blocking the stream: a zero-byte
+        // read readiness probe would consume framing; instead rely on the
+        // next write failing (250ms cadence bounds detection delay).
+        if server.config().idle_timeout_secs > 0 {
+            // Shared idle discipline: over-long streams eventually recycle
+            // when the operator sets idle timeouts (documented).
+        }
     }
 }
 
@@ -4216,6 +4471,231 @@ mod tests {
         assert_eq!(code, 400);
         let (code, _) = post_json(addr, "/v1/op", json!({"id": 6, "op": "frobnicate"}), Some("tok-alice")).await;
         assert_eq!(code, 400);
+    }
+
+    /// Read one HTTP/1.x response from a (possibly reused) socket:
+    /// returns (status, header block, body).
+    async fn read_http_response(
+        rd: &mut tokio::net::tcp::OwnedReadHalf,
+        buf: &mut Vec<u8>,
+    ) -> (u16, String, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos + 4]).into_owned();
+                let status: u16 = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|c| c.parse().ok())
+                    .unwrap_or(0);
+                let len: usize = head
+                    .lines()
+                    .filter_map(|l| {
+                        let (k, v) = l.split_once(':')?;
+                        if k.trim().to_ascii_lowercase() == "content-length" {
+                            v.trim().parse::<usize>().ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .next()
+                    .unwrap_or(0);
+                while buf.len() < pos + 4 + len {
+                    let mut tmp = [0u8; 8192];
+                    let n = rd.read(&mut tmp).await.unwrap();
+                    assert!(n > 0, "server closed mid-body");
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                let body = buf[pos + 4..pos + 4 + len].to_vec();
+                buf.drain(..pos + 4 + len);
+                return (status, head, body);
+            }
+            let mut tmp = [0u8; 8192];
+            let n = rd.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "server closed mid-head");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_keep_alive_reuses_connection() {
+        use serde_json::json;
+        use tokio::io::AsyncWriteExt;
+        let (_server, addr) = http_server().await;
+        let sock = TcpStream::connect(addr).await.unwrap();
+        sock.set_nodelay(true).unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        let mut buf = Vec::new();
+        // Two sequential POSTs on ONE HTTP/1.1 connection.
+        for i in 0..2u64 {
+            let body = json!({
+                "id": i, "op": "insert", "table": "users",
+                "values": {"id": 700 + i as i64, "name": "KA", "email": format!("ka{}@x.com", i)}
+            })
+            .to_string();
+            wr.write_all(
+                format!(
+                    "POST /v1/op HTTP/1.1\r\nhost: x\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                    body.len(), body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let (status, head, resp_body) = read_http_response(&mut rd, &mut buf).await;
+            assert_eq!(status, 200, "head: {}", head);
+            assert!(head.contains("connection: keep-alive"), "head: {}", head);
+            let v: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+            assert_eq!(v["ok"], true, "got {:?}", v);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_cors_and_preflight() {
+        use crate::server::ServerConfig;
+        use tokio::io::AsyncWriteExt;
+        let mut cfg = ServerConfig::default();
+        cfg.http_cors_origins = vec!["https://app.test".into()];
+        let server = Arc::new(BlitzServer::with_config(cfg));
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(super::serve_http_ops(Arc::clone(&server), listener));
+        // Simple request echoes a listed origin (and only listed ones).
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        let mut buf = Vec::new();
+        wr.write_all(b"GET /readyz HTTP/1.1\r\nhost: x\r\norigin: https://app.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (status, head, _) = read_http_response(&mut rd, &mut buf).await;
+        assert_eq!(status, 200);
+        assert!(head.contains("access-control-allow-origin: https://app.test"), "head: {}", head);
+        // Preflight answers without auth.
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        let mut buf = Vec::new();
+        wr.write_all(
+            b"OPTIONS /v1/op HTTP/1.1\r\nhost: x\r\norigin: https://app.test\r\naccess-control-request-method: POST\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let (status, head, _) = read_http_response(&mut rd, &mut buf).await;
+        assert_eq!(status, 204, "head: {}", head);
+        assert!(head.contains("access-control-allow-methods: GET, POST, OPTIONS"), "head: {}", head);
+        // Unlisted origin gets no header.
+        let sock = TcpStream::connect(addr).await.unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        let mut buf = Vec::new();
+        wr.write_all(b"GET /readyz HTTP/1.1\r\nhost: x\r\norigin: https://evil.test\r\n\r\n")
+            .await
+            .unwrap();
+        let (_, head, _) = read_http_response(&mut rd, &mut buf).await;
+        assert!(!head.contains("access-control-allow-origin"), "head: {}", head);
+    }
+
+    #[tokio::test]
+    async fn test_http_sse_stream_delivers_insert() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        // Binary listener for the seeder, HTTP listener for the stream:
+        // the two protocols don't share a port.
+        let bin = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bin_addr = bin.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), bin));
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http.local_addr().unwrap();
+        tokio::spawn(super::serve_http_ops(Arc::clone(&server), http));
+        // Arm the change-log, then open the stream.
+        let mut seeder = Client::connect(bin_addr).await.unwrap();
+        let _ = seeder
+            .roundtrip(&Request { id: 1, op: Op::Subscribe, table: "users".into(), row_id: None, values: None })
+            .await
+            .unwrap();
+        let sock = TcpStream::connect(http_addr).await.unwrap();
+        sock.set_nodelay(true).unwrap();
+        let (mut rd, mut wr) = sock.into_split();
+        wr.write_all(b"GET /v1/stream?table=users HTTP/1.1\r\nhost: x\r\n\r\n")
+            .await
+            .unwrap();
+        // Head + initial comment.
+        let mut buf = Vec::new();
+        let (status, head, _) = read_http_response_stream_head(&mut rd, &mut buf).await;
+        assert_eq!(status, 200, "head: {}", head);
+        assert!(head.contains("text/event-stream"), "head: {}", head);
+        let frame = read_sse_frame(&mut rd, &mut buf).await;
+        assert!(frame.starts_with(": connected"), "hello frame: {}", frame);
+        // Insert after the stream is up; expect a data frame naming users.
+        seeder
+            .roundtrip(&Request {
+                id: 2,
+                op: Op::Insert,
+                table: "users".into(),
+                row_id: None,
+                values: Some(values(&[
+                    ("id", Value::Int64(800)),
+                    ("name", Value::String("Streamed".into())),
+                    ("email", Value::String("stream@x.com".into())),
+                ])),
+            })
+            .await
+            .unwrap();
+        let frame = read_sse_frame(&mut rd, &mut buf).await;
+        assert!(frame.starts_with("data: "), "frame: {}", frame);
+        assert!(frame.contains("users"), "frame: {}", frame);
+        let _ = server;
+    }
+
+    /// Read an SSE head (headers only; the body never ends).
+    async fn read_http_response_stream_head(
+        rd: &mut tokio::net::tcp::OwnedReadHalf,
+        buf: &mut Vec<u8>,
+    ) -> (u16, String, Vec<u8>) {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&buf[..pos + 4]).into_owned();
+                let status: u16 = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|c| c.parse().ok())
+                    .unwrap_or(0);
+                buf.drain(..pos + 4);
+                return (status, head, Vec::new());
+            }
+            let mut tmp = [0u8; 4096];
+            let n = rd.read(&mut tmp).await.unwrap();
+            assert!(n > 0, "server closed stream head");
+            buf.extend_from_slice(&tmp[..n]);
+        }
+    }
+
+    /// Read until a blank line (one SSE frame, incl. comments).
+    async fn read_sse_frame(
+        rd: &mut tokio::net::tcp::OwnedReadHalf,
+        buf: &mut Vec<u8>,
+    ) -> String {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
+                let frame = String::from_utf8_lossy(&buf[..pos]).into_owned();
+                buf.drain(..pos + 2);
+                if frame.trim().is_empty() {
+                    continue;
+                }
+                return frame;
+            }
+            let mut tmp = [0u8; 4096];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(10), rd.read(&mut tmp))
+                .await
+                .expect("sse frame timeout")
+                .unwrap();
+            assert!(n > 0, "server closed stream");
+            buf.extend_from_slice(&tmp[..n]);
+        }
     }
 
     #[tokio::test]

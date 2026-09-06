@@ -83,13 +83,15 @@ pub struct ServerConfig {
     /// indexes are per-shard (global uniqueness needs the shard key to be
     /// the unique column, or unsharded tables).
     pub table_shards: HashMap<String, ShardSpec>,
-    /// Row ownership: `table -> owner column`. When set, point ops are
-    /// owner-checked (insert values / stored row must equal the caller's
-    /// subject, or admin role); collection reads (Scan/Find/Subscribe/Search)
-    /// on the table are rejected fail-closed (v1: no silent row-dropping —
-    /// pagination/counts would lie; query-time filtering is future work).
-    /// Empty (default) = table-level auth only.
+    /// Row ownership: `table -> owner column`. When set (and auth on),
+    /// point ops are owner-checked; collection reads filter by owner
+    /// (Scan pre-window, Find/Subscribe/Search per-row; push streams stay
+    /// rejected — poll instead). Empty (default) = table-level auth only.
     pub row_owner: HashMap<String, String>,
+    /// HTTP bridge CORS: allowed `Origin` values (`["*"]` = any). Empty
+    /// (default) = no CORS headers (same-origin / curl only). Browsers
+    /// block cross-origin fetch without these — set for SPA templates.
+    pub http_cors_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
@@ -112,6 +114,7 @@ impl Default for ServerConfig {
             auth_tokens: HashMap::new(),
             table_shards: HashMap::new(),
             row_owner: HashMap::new(),
+            http_cors_origins: Vec::new(),
         }
     }
 }
