@@ -46,6 +46,9 @@ pub const MAX_FLUSH_OPS: usize = 4096;
 pub const FLUSH_CHUNK: usize = 16;
 /// Default per-call timeout (flush + server + read).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Minimum server release this SDK speaks to (§35: clear errors, never
+/// mysterious decode failures).
+pub const MIN_SERVER_VERSION: &str = "0.1.0";
 
 /// A row with its (possibly shard-routed) global id.
 pub type Row = RowView;
@@ -97,6 +100,10 @@ impl Client {
             .map_err(|_| SdkError::Timeout(timeout.as_millis() as u64))?
             .map_err(|e| SdkError::Transport(format!("connect {}: {}", addr, e)))?;
         stream.set_nodelay(true).map_err(|e| SdkError::Transport(e.to_string()))?;
+        let mut stream = stream;
+        // Compatibility handshake first (§35): one RTT that turns
+        // version skew into a readable error instead of later garbage.
+        check_wire_compat(&mut stream, timeout).await?;
         let (tx, rx) = mpsc::unbounded_channel();
         tokio::spawn(worker_loop(addr, stream, rx, timeout));
         Ok(Self {
@@ -153,6 +160,8 @@ impl Client {
             Err(map_server_error(&resp.error.unwrap_or_else(|| "unknown error".into())))
         }
     }
+
+    // -- Primitive ops (each looks single; the worker batches) ---------
 
     // -- Primitive ops (each looks single; the worker batches) ---------
 
@@ -496,6 +505,93 @@ async fn flush_once(
     }
 }
 
+/// Parse `major.minor.patch` (ignores pre-release/build metadata).
+fn parse_version(v: &str) -> Option<(u64, u64, u64)> {
+    let core = v.split(['-', '+']).next()?;
+    let mut it = core.split('.');
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+/// Compatibility verdict (§35): exact protocol match plus server floor.
+/// Pure (unit-tested); the wire reading lives in `check_wire_compat`.
+pub fn check_compat(server: &str, protocol: u8) -> SdkResult<()> {
+    if protocol != blitz_protocol::PROTOCOL_VERSION {
+        return Err(SdkError::Server(format!(
+            "BlitzDB client v{} (protocol {}) requires server protocol {} (server v{} speaks v{})",
+            env!("CARGO_PKG_VERSION"),
+            blitz_protocol::PROTOCOL_VERSION,
+            blitz_protocol::PROTOCOL_VERSION,
+            server,
+            protocol
+        )));
+    }
+    let floor = parse_version(MIN_SERVER_VERSION).unwrap_or((0, 1, 0));
+    match parse_version(server) {
+        Some(v) if v >= floor => Ok(()),
+        _ => Err(SdkError::Server(format!(
+            "BlitzDB client v{} requires BlitzDB server >= {} (found {})",
+            env!("CARGO_PKG_VERSION"),
+            MIN_SERVER_VERSION,
+            server
+        ))),
+    }
+}
+
+/// One-shot version handshake on a fresh stream (pre-worker, pre-batcher).
+async fn check_wire_compat(stream: &mut TcpStream, timeout: Duration) -> SdkResult<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let codec = FrameCodec::with_default_limit();
+    let frame = codec
+        .encode_request(&Request { id: 0, op: Op::Version, table: String::new(), row_id: None, values: None })
+        .map_err(|e| SdkError::Transport(format!("version encode: {}", e)))?;
+    tokio::time::timeout(timeout, stream.write_all(&frame))
+        .await
+        .map_err(|_| SdkError::Timeout(timeout.as_millis() as u64))?
+        .map_err(|e| SdkError::Transport(format!("version write: {}", e)))?;
+    let mut buf = BytesMut::new();
+    loop {
+        let mut tmp = [0u8; 4096];
+        let n = tokio::time::timeout(timeout, stream.read(&mut tmp))
+            .await
+            .map_err(|_| SdkError::Timeout(timeout.as_millis() as u64))?
+            .map_err(|e| SdkError::Transport(format!("version read: {}", e)))?;
+        if n == 0 {
+            return Err(SdkError::Transport("server closed during version check".into()));
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        // Read until a full frame arrives (usually the first read).
+        let payload = loop {
+            match codec.feed(&mut buf) {
+                Ok(Some(p)) => break Some(p),
+                Ok(None) => break None,
+                Err(e) => return Err(SdkError::Transport(format!("version framing: {}", e))),
+            }
+        };
+        if let Some(p) = payload {
+            let resp = codec
+                .decode_response(p)
+                .map_err(|e| SdkError::Transport(format!("version decode: {}", e)))?;
+            if !resp.ok {
+                return Err(SdkError::Transport(format!("version refused: {:?}", resp.error)));
+            }
+            let row = resp.rows.into_iter().next().ok_or_else(|| SdkError::Transport("empty version response".into()))?;
+            let server = match row.values.get("server") {
+                Some(Value::String(s)) => s.clone(),
+                _ => return Err(SdkError::Transport("version response missing server string".into())),
+            };
+            let protocol = match row.values.get("protocol") {
+                Some(Value::Int64(n)) => *n as u8,
+                Some(Value::UInt64(n)) => *n as u8,
+                _ => return Err(SdkError::Transport("version response missing protocol int".into())),
+            };
+            return check_compat(&server, protocol);
+        }
+        if buf.len() > 65536 {
+            return Err(SdkError::Transport("version response too large".into()));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -513,6 +609,21 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         tokio::spawn(blitz_server::serve(Arc::clone(&server), listener));
         (addr, server)
+    }
+
+    #[test]
+    fn compat_matrix() {
+        // Exact protocol + floor pass.
+        assert!(check_compat("0.1.0", blitz_protocol::PROTOCOL_VERSION).is_ok());
+        assert!(check_compat("1.4.2", blitz_protocol::PROTOCOL_VERSION).is_ok());
+        // Protocol skew names both sides (§35, no mystery).
+        let err = check_compat("0.1.0", blitz_protocol::PROTOCOL_VERSION + 1).unwrap_err();
+        assert!(err.to_string().contains("requires server protocol"), "got {}", err);
+        // Old server names the floor.
+        let err = check_compat("0.0.9", blitz_protocol::PROTOCOL_VERSION).unwrap_err();
+        assert!(err.to_string().contains("requires BlitzDB server >="), "got {}", err);
+        // Garbage versions fail closed, not panicked.
+        assert!(check_compat("banana", blitz_protocol::PROTOCOL_VERSION).is_err());
     }
 
     #[tokio::test]

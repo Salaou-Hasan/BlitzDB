@@ -51,6 +51,18 @@ after(() => {
 });
 
 describe('client', { skip: !haveServer && 'Blitz binary missing (cargo build -p blitz-cli)' } as object, () => {
+  it('compat matrix and live handshake', async () => {
+    const { Client: C, MIN_SERVER_VERSION } = await import('../src/client.ts');
+    // Pure matrix (no server).
+    C.checkCompat('0.1.0', 2);
+    C.checkCompat('1.4.2', 2);
+    assert.throws(() => C.checkCompat('0.1.0', 3), /requires server protocol/);
+    assert.throws(() => C.checkCompat('0.0.9', 2), /requires BlitzDB server >=/);
+    assert.throws(() => C.checkCompat('banana', 2), /requires BlitzDB server >=/);
+    // Live connect already handshook (all other tests passed through it).
+    assert.equal(MIN_SERVER_VERSION, '0.1.0');
+  });
+
   it('crud roundtrip', async () => {
     const c = await Client.connect(port);
     try {

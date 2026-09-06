@@ -1,0 +1,11 @@
+{
+  "manifest": 1,
+  "name": "ts-minimal",
+  "version": "0.1.0",
+  "language": "typescript",
+  "framework": "none",
+  "description": "Minimal TypeScript script using @blitzdb/client (ping + insert + get).",
+  "sdk": { "name": "@blitzdb/client", "range": ">=0.1.0, <1.0.0" },
+  "protocol": { "min": 2, "max": 2 },
+  "server": { "min": "0.1.0" }
+}

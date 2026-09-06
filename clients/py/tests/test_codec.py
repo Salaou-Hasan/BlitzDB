@@ -95,3 +95,21 @@ class TestFrames(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCompat(unittest.TestCase):
+    def test_matrix(self):
+        from blitz_client.client import check_compat, parse_version
+        from blitz_client.errors import SdkError
+        check_compat("0.1.0", 2)
+        check_compat("1.4.2", 2)
+        with self.assertRaises(SdkError) as ctx:
+            check_compat("0.1.0", 3)
+        self.assertIn("requires server protocol", str(ctx.exception))
+        with self.assertRaises(SdkError) as ctx:
+            check_compat("0.0.9", 2)
+        self.assertIn("requires BlitzDB server >=", str(ctx.exception))
+        with self.assertRaises(SdkError):
+            check_compat("banana", 2)
+        self.assertEqual(parse_version("1.2.3"), (1, 2, 3))
+        self.assertIsNone(parse_version("nope"))

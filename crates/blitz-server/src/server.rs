@@ -134,6 +134,10 @@ impl ShardSpec {
     }
 }
 
+/// Server release version (workspace Cargo version, advertised via
+/// `Op::Version` for SDK compatibility checks).
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// High 8 RowId bits carry the shard; low 56 are engine-local.
 pub const SHARD_SHIFT: u32 = 56;
 pub const LOCAL_MASK: u64 = 0x00FF_FFFF_FFFF_FFFF;
@@ -945,7 +949,7 @@ impl BlitzServer {
             Op::ProcDeploy => Permission::Custom("proc.deploy".to_string()),
             Op::ProcList => Permission::Custom("proc.list".to_string()),
             Op::ProcDrop => Permission::Custom("proc.drop".to_string()),
-            Op::Ping => return Ok(()),
+            Op::Ping | Op::Version => return Ok(()),
         };
         let id = ident.as_ref().ok_or("unauthorized: authentication required")?;
         if id.has_permission(&perm) {

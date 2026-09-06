@@ -52,6 +52,10 @@ pub enum Op {
     ProcList,
     /// Drop a procedure: `table` is `fn:<name>`. Needs `proc.drop` rights.
     ProcDrop,
+    /// Server version handshake: no auth, table/values ignored. Responds
+    /// one row `{server, protocol}`. SDKs call this at connect and fail
+    /// fast on mismatch (clear errors, never mysterious decode failures).
+    Version,
 }
 
 impl Op {
@@ -72,6 +76,7 @@ impl Op {
             Op::ProcDeploy => 12,
             Op::ProcList => 13,
             Op::ProcDrop => 14,
+            Op::Version => 15,
         }
     }
 
@@ -92,6 +97,7 @@ impl Op {
             12 => Some(Op::ProcDeploy),
             13 => Some(Op::ProcList),
             14 => Some(Op::ProcDrop),
+            15 => Some(Op::Version),
             _ => None,
         }
     }
@@ -201,11 +207,12 @@ mod tests {
             (Op::ProcDeploy, 12),
             (Op::ProcList, 13),
             (Op::ProcDrop, 14),
+            (Op::Version, 15),
         ] {
             assert_eq!(op.tag(), tag);
             assert_eq!(Op::from_tag(tag), Some(op));
         }
-        assert_eq!(Op::from_tag(15), None);
+        assert_eq!(Op::from_tag(16), None);
         assert_eq!(Op::from_tag(255), None);
     }
 

@@ -2,7 +2,9 @@ use anyhow::Result;
 use blitz_core::table::TableEngine;
 use blitz_server::{BlitzServer, ServerConfig};
 use clap::{Parser, Subcommand};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+mod compat;
 
 #[derive(Parser)]
 #[command(
@@ -68,7 +70,7 @@ enum Commands {
     /// Check server status (requires running server)
     Status {
         /// Server host
-        #[arg(short, long, default_value = "127.0.0.1")]
+        #[arg(long, default_value = "127.0.0.1")]
         host: String,
 
         /// Server port
@@ -87,7 +89,58 @@ enum Commands {
         format: String,
     },
 
-    /// Initialize a new database directory
+    /// Database administration (moved from top-level `init`/`rotate`:
+    /// `blitz init` now scaffolds projects — see its help).
+    Db {
+        #[command(subcommand)]
+        cmd: DbCommands,
+    },
+
+    /// Scaffold a project from a discovered template (`templates/`).
+    /// Templates declare SDK/protocol/server ranges in
+    /// `blitz.template.json`; incompatible combos fail with a clear
+    /// error instead of a broken project. Writes `blitz.project.json`.
+    Init {
+        /// Project directory to create (must not exist or must be empty)
+        #[arg(default_value = ".")]
+        dir: String,
+
+        /// Template directories to scan (repeatable; default: ./templates)
+        #[arg(long)]
+        templates: Vec<PathBuf>,
+
+        /// Template name (skips the picker)
+        #[arg(long)]
+        template: Option<String>,
+
+        /// Known SDK version `name=version` (repeatable)
+        #[arg(long)]
+        sdk_version: Vec<String>,
+
+        /// Live server to probe for versions (`host:port`)
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Server version override (when no live server)
+        #[arg(long)]
+        server_version: Option<String>,
+
+        /// Protocol version override (when no live server)
+        #[arg(long)]
+        protocol: Option<u8>,
+
+        /// Take the first fully-compatible template without asking
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Show performance metrics
+    Metrics,
+}
+
+#[derive(Subcommand)]
+enum DbCommands {
+    /// Initialize a new database directory (writes blitz.json server config)
     Init {
         /// Directory to initialize
         #[arg(short, long, default_value = ".")]
@@ -101,9 +154,6 @@ enum Commands {
         #[arg(short, long)]
         dir: String,
     },
-
-    /// Show performance metrics
-    Metrics,
 }
 
 #[tokio::main]
@@ -234,13 +284,26 @@ async fn main() -> Result<()> {
 
         Commands::Version => {
             println!("blitz-cli v{}", env!("CARGO_PKG_VERSION"));
+            println!(
+                "protocol v{} (wire compatibility floor for all SDKs)",
+                blitz_protocol::PROTOCOL_VERSION
+            );
             println!("BlitzDB - A general-purpose high-performance application database/runtime");
             println!("Rust edition: 2021");
         }
 
         Commands::Status { host, port } => {
-            println!("Checking status at {}:{}", host, port);
-            println!("Status: up and running");
+            // Real probe (was a hard-coded string): version handshake.
+            match compat::probe_server(&host, port).await {
+                Ok(info) => {
+                    println!("Status: up at {}:{}", host, port);
+                    println!("server v{} / protocol v{}", info.server, info.protocol);
+                }
+                Err(e) => {
+                    println!("Status: unreachable at {}:{} ({})", host, port, e);
+                    std::process::exit(1);
+                }
+            }
         }
 
         Commands::Query { sql, format } => {
@@ -252,28 +315,52 @@ async fn main() -> Result<()> {
             println!("Executed in-memory mode");
         }
 
-        Commands::Init { dir } => {
-            let path = Path::new(&dir);
-            if !path.exists() {
-                std::fs::create_dir_all(path)?;
+        Commands::Db { cmd } => match cmd {
+            DbCommands::Init { dir } => {
+                let path = Path::new(&dir);
+                if !path.exists() {
+                    std::fs::create_dir_all(path)?;
+                }
+
+                let config_path = path.join("blitz.json");
+                let config = serde_json::json!({
+                    "version": "0.1.0",
+                    "host": "127.0.0.1",
+                    "port": 7420,
+                    "data_dir": dir,
+                });
+
+                std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
+                println!("Initialized BlitzDB in {}", dir);
+                println!("Config written to {}", config_path.display());
             }
+            DbCommands::Rotate { dir } => {
+                let snap = blitz_server::durability::offline_rotate(&dir)?;
+                println!("rotated: snapshot {}", snap.display());
+            }
+        },
 
-            let config_path = path.join("blitz.json");
-            let config = serde_json::json!({
-                "version": "0.1.0",
-                "host": "127.0.0.1",
-                "port": 7420,
-                "data_dir": dir,
-            });
-
-            std::fs::write(&config_path, serde_json::to_string_pretty(&config)?)?;
-            println!("Initialized BlitzDB in {}", dir);
-            println!("Config written to {}", config_path.display());
-        }
-
-        Commands::Rotate { dir } => {
-            let snap = blitz_server::durability::offline_rotate(&dir)?;
-            println!("rotated: snapshot {}", snap.display());
+        Commands::Init {
+            dir,
+            templates,
+            template,
+            sdk_version,
+            server,
+            server_version,
+            protocol,
+            yes,
+        } => {
+            compat::run_init(compat::InitArgs {
+                dir: PathBuf::from(dir),
+                template_dirs: templates,
+                template,
+                sdk_version,
+                server,
+                server_version,
+                protocol,
+                yes,
+            })
+            .await?;
         }
 
         Commands::Metrics => {

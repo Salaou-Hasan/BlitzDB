@@ -270,6 +270,14 @@ pub(crate) fn dispatch(server: &std::sync::Arc<BlitzServer>, authed: &Option<bli
     let id = req.id;
     match req.op {
         Op::Ping => Response::ok(id, Vec::new()),
+        Op::Version => {
+            // No auth, no table: bootstrap handshake for SDK compatibility
+            // checks (must work before any handshake or grant exists).
+            let mut values = std::collections::HashMap::new();
+            values.insert("server".to_string(), Value::String(crate::server::SERVER_VERSION.to_string()));
+            values.insert("protocol".to_string(), Value::Int64(blitz_protocol::PROTOCOL_VERSION as i64));
+            Response::ok(id, vec![RowView { id: 0, values }])
+        }
         Op::Insert => {
             let mut values = match req.values {
                 Some(v) => v,
@@ -828,7 +836,7 @@ pub(crate) fn execute_atomic(
         // Snapshot ops would read outside tx versioning, nested Calls
         // would nest transactions, and job ops spawn background work that
         // can't roll back: reject, don't fake.
-        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop) {
+        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop | Op::Version) {
             return abort_all(format!(
                 "atomic batch aborted: {:?} not supported in atomic batch",
                 op.op
@@ -1015,7 +1023,7 @@ pub(crate) fn execute_atomic(
                 let (shard, _) = BlitzServer::split_id(global);
                 buffered.push((rid, Buffered::Delete { base: op.table, physical, shard, local: local_id, global }));
             }
-            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop => {
+            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop | Op::Version => {
                 return fail(&mut tx, rid, format!("{:?} not supported in atomic batch", op.op))
             }
         }
@@ -5004,6 +5012,37 @@ mod tests {
         .await
         .unwrap();
         assert!(b.results.iter().all(|x| !x.ok), "registry op must abort atomic: {:?}", b.results);
+    }
+
+    #[tokio::test]
+    async fn test_version_handshake_no_auth() {
+        // No handshake, no grants: version always answers (bootstrap).
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let r = client
+            .roundtrip(&Request { id: 1, op: Op::Version, table: "".into(), row_id: None, values: None })
+            .await
+            .unwrap();
+        assert!(r.ok, "version failed: {:?}", r.error);
+        assert_eq!(
+            r.rows[0].values.get("server"),
+            Some(&Value::String(crate::server::SERVER_VERSION.to_string()))
+        );
+        assert_eq!(
+            r.rows[0].values.get("protocol"),
+            Some(&Value::Int64(blitz_protocol::PROTOCOL_VERSION as i64))
+        );
+        // Meaningless inside atomic frames (not versioned state): rejected.
+        let b = roundtrip_atomic(&mut client, 50, vec![Request {
+            id: 51, op: Op::Version, table: "".into(), row_id: None, values: None,
+        }])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|x| !x.ok), "version must abort atomic: {:?}", b.results);
     }
 
     #[tokio::test]

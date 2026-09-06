@@ -13,6 +13,9 @@ path = "src/main.rs"
 blitz-types = { path = "../blitz-types" }
 blitz-core = { path = "../blitz-core" }
 blitz-server = { path = "../blitz-server" }
+blitz-protocol = { path = "../blitz-protocol" }
+bytes = { workspace = true }
+semver = "1"
 thiserror = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tracing = { workspace = true }

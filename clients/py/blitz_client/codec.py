@@ -25,6 +25,9 @@ KIND_BATCH_RESPONSE = 0x12
 OP_TO_TAG = {
     "ping": 0, "insert": 1, "get": 2, "update": 3, "delete": 4,
     "scan": 5, "subscribe": 6, "find": 7, "search": 8, "call": 9,
+    "job_submit": 10, "job_poll": 11,
+    "proc_deploy": 12, "proc_list": 13, "proc_drop": 14,
+    "version": 15,
 }
 TAG_TO_OP = {v: k for k, v in OP_TO_TAG.items()}
 

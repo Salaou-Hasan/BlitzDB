@@ -201,3 +201,26 @@ func TestBatchResponse(t *testing.T) {
 		t.Fatalf("row: %+v", back.Results[0].Rows[0])
 	}
 }
+
+func TestCompatMatrix(t *testing.T) {
+	if err := CheckCompat("0.1.0", 2); err != nil {
+		t.Fatalf("happy: %v", err)
+	}
+	if err := CheckCompat("1.4.2", 2); err != nil {
+		t.Fatalf("happy: %v", err)
+	}
+	if err := CheckCompat("0.1.0", 3); err == nil {
+		t.Fatal("protocol skew must fail")
+	} else if se, ok := err.(*SdkError); !ok || se.Kind != ErrServer {
+		t.Fatalf("kind: %v", err)
+	}
+	if err := CheckCompat("0.0.9", 2); err == nil {
+		t.Fatal("old server must fail")
+	}
+	if err := CheckCompat("banana", 2); err == nil {
+		t.Fatal("garbage must fail")
+	}
+	if v, ok := parseVersion("1.2.3"); !ok || v != [3]uint64{1, 2, 3} {
+		t.Fatalf("parse: %v %v", v, ok)
+	}
+}

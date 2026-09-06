@@ -27,6 +27,39 @@ from .codec import FrameCodec
 from .errors import SdkError, map_server_error
 
 DEFAULT_TIMEOUT = 5.0
+
+CLIENT_VERSION = "0.1.0"
+MIN_SERVER_VERSION = "0.1.0"
+PROTOCOL_VERSION_PY = 2
+
+
+def parse_version(v: str):
+    """Parse major.minor.patch (ignores pre-release/build metadata)."""
+    core = v.split("-")[0].split("+")[0]
+    parts = core.split(".")
+    if len(parts) < 3:
+        return None
+    try:
+        nums = tuple(int(x) if x.isdigit() else None for x in parts[:3])
+    except ValueError:
+        return None
+    return nums
+
+
+def check_compat(server: str, protocol: int) -> None:
+    """Compatibility verdict (§35): exact protocol match plus server floor."""
+    if protocol != PROTOCOL_VERSION_PY:
+        raise SdkError(SdkError.SERVER,
+                       f"BlitzDB client v{CLIENT_VERSION} (protocol {PROTOCOL_VERSION_PY}) "
+                       f"requires server protocol {PROTOCOL_VERSION_PY} "
+                       f"(server v{server} speaks v{protocol})")
+    floor = parse_version(MIN_SERVER_VERSION) or (0, 1, 0)
+    got = parse_version(server)
+    if got is None or not all(g is not None for g in got) or tuple(got) < floor:
+        raise SdkError(SdkError.SERVER,
+                       f"BlitzDB client v{CLIENT_VERSION} requires BlitzDB server "
+                       f">= {MIN_SERVER_VERSION} (found {server})")
+
 MAX_FLUSH_OPS = 4096
 FLUSH_CHUNK = 16
 
@@ -72,7 +105,42 @@ class Client:
         sock = socket.create_connection((host, port), timeout=timeout)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.settimeout(timeout)
-        return cls(sock, host, port, timeout)
+        client = cls(sock, host, port, timeout)
+        # Compatibility handshake first (§35): one RTT that turns version
+        # skew into a readable error instead of later garbage.
+        client._check_server_version()
+        return client
+
+    def _check_server_version(self) -> None:
+        from .codec import FrameCodec
+        codec = FrameCodec()
+        frame = codec.encode_request({"id": 0, "op": "version", "table": ""})
+        try:
+            self._sock.sendall(frame)
+            # Feed each chunk once: the codec stashes internally until the
+            # single response frame completes (usually the first read).
+            payloads: list = []
+            while not payloads:
+                chunk = self._sock.recv(4096)
+                if not chunk:
+                    raise SdkError(SdkError.TRANSPORT, "closed during version check")
+                payloads = codec.feed(chunk)
+        except SdkError:
+            raise
+        except Exception as err:
+            raise SdkError(SdkError.TRANSPORT, f"version check: {err}")
+        resp = codec.decode_response(payloads[0])
+        if not resp["ok"]:
+            raise SdkError(SdkError.TRANSPORT, f"version refused: {resp.get('error')}")
+        rows = resp["rows"]
+        if not rows:
+            raise SdkError(SdkError.TRANSPORT, "empty version response")
+        values = rows[0]["values"]
+        server = values.get("server")
+        protocol = values.get("protocol")
+        if not isinstance(server, str) or not isinstance(protocol, int):
+            raise SdkError(SdkError.TRANSPORT, "malformed version response")
+        check_compat(server, protocol)
 
     def close(self) -> None:
         self._closed = True

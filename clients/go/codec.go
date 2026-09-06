@@ -37,12 +37,14 @@ const (
 	OpProcDep   = "proc_deploy"
 	OpProcList  = "proc_list"
 	OpProcDrop  = "proc_drop"
+	OpVersion   = "version"
 )
 
 var opToTag = map[string]byte{
 	OpPing: 0, OpInsert: 1, OpGet: 2, OpUpdate: 3, OpDelete: 4,
 	OpScan: 5, OpSubscribe: 6, OpFind: 7, OpSearch: 8, OpCall: 9,
 	OpJobSubmit: 10, OpJobPoll: 11, OpProcDep: 12, OpProcList: 13, OpProcDrop: 14,
+	OpVersion: 15,
 }
 
 var tagToOp = func() map[byte]string {

@@ -13,6 +13,12 @@ import (
 const (
 	// DefaultTimeout bounds one call (queue + service).
 	DefaultTimeout = 5 * time.Second
+	// ClientVersion mirrors the SDK release (§35 messages).
+	ClientVersion = "0.1.0"
+	// MinServerVersion is the floor this SDK speaks to (§35).
+	MinServerVersion = "0.1.0"
+	// ProtocolVersionGo must match the server exactly.
+	ProtocolVersionGo = 2
 	// MaxFlushOps caps one flush frame (protocol bound).
 	MaxFlushOps = 4096
 	// FlushChunk bounds head-of-line wait inside a frame.
@@ -102,6 +108,12 @@ func ConnectTimeout(host string, port int, timeout time.Duration) (*Client, erro
 	}
 	c.nextID.Store(1)
 	c.idemNext.Store(1)
+	// Compatibility handshake first (§35): one RTT that turns version
+	// skew into a readable error instead of later garbage.
+	if err := c.checkServerVersion(); err != nil {
+		conn.Close()
+		return nil, err
+	}
 	go c.worker()
 	return c, nil
 }
@@ -136,6 +148,149 @@ func (c *Client) exec(req Request, retrySafe, direct bool) (Response, error) {
 	// plus per-flush socket deadlines, and always settles every pending.
 	r := <-p.respCh
 	return r.resp, r.err
+}
+
+// parseVersion parses major.minor.patch (ignores pre-release/build).
+func parseVersion(v string) ([3]uint64, bool) {
+	var out [3]uint64
+	core := v
+	if j := indexByte(core, '-'); j >= 0 {
+		core = core[:j]
+	} else if j := indexByte(core, '+'); j >= 0 {
+		core = core[:j]
+	}
+	parts := splitDots(core)
+	if len(parts) < 3 {
+		return out, false
+	}
+	for i := 0; i < 3; i++ {
+		n, ok := parseUintDec(parts[i])
+		if !ok {
+			return out, false
+		}
+		out[i] = n
+	}
+	return out, true
+}
+
+func indexByte(s string, c byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == c {
+			return i
+		}
+	}
+	return -1
+}
+
+func splitDots(s string) []string {
+	var parts []string
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == '.' {
+			parts = append(parts, s[start:i])
+			start = i + 1
+		}
+	}
+	return parts
+}
+
+func parseUintDec(s string) (uint64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	var n uint64
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + uint64(s[i]-'0')
+	}
+	return n, true
+}
+
+func cmpVersion(a, b [3]uint64) int {
+	for i := 0; i < 3; i++ {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	return 0
+}
+
+// CheckCompat is the §35 verdict: exact protocol match plus server floor.
+func CheckCompat(server string, protocol int) error {
+	if protocol != ProtocolVersionGo {
+		return newErr(ErrServer, fmt.Sprintf(
+			"BlitzDB client v%s (protocol %d) requires server protocol %d (server v%s speaks v%d)",
+			ClientVersion, ProtocolVersionGo, ProtocolVersionGo, server, protocol))
+	}
+	floor, _ := parseVersion(MinServerVersion)
+	got, ok := parseVersion(server)
+	if !ok || cmpVersion(got, floor) < 0 {
+		return newErr(ErrServer, fmt.Sprintf(
+			"BlitzDB client v%s requires BlitzDB server >= %s (found %s)",
+			ClientVersion, MinServerVersion, server))
+	}
+	return nil
+}
+
+// checkServerVersion performs the one-shot pre-worker handshake.
+func (c *Client) checkServerVersion() error {
+	codec := NewFrameCodec()
+	frame, err := codec.EncodeRequest(Request{ID: 0, Op: OpVersion, Table: ""})
+	if err != nil {
+		return newErr(ErrTransport, "version encode: "+err.Error())
+	}
+	_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
+	if _, err := c.conn.Write(frame); err != nil {
+		return newErr(ErrTransport, "version write: "+err.Error())
+	}
+	tmp := make([]byte, 4096)
+	for {
+		n, err := c.conn.Read(tmp)
+		if err != nil {
+			return newErr(ErrTransport, "version read: "+err.Error())
+		}
+		if n == 0 {
+			return newErr(ErrTransport, "closed during version check")
+		}
+		payloads, err := codec.Feed(tmp[:n])
+		if err != nil {
+			return newErr(ErrTransport, "version framing: "+err.Error())
+		}
+		if len(payloads) == 0 {
+			continue
+		}
+		resp, err := codec.DecodeResponse(payloads[0])
+		if err != nil {
+			return newErr(ErrTransport, "version decode: "+err.Error())
+		}
+		if !resp.OK {
+			return newErr(ErrTransport, "version refused: "+resp.Error)
+		}
+		if len(resp.Rows) == 0 {
+			return newErr(ErrTransport, "empty version response")
+		}
+		server, _ := resp.Rows[0].Values["server"].(string)
+		var protocol int
+		switch v := resp.Rows[0].Values["protocol"].(type) {
+		case int64:
+			protocol = int(v)
+		case uint64:
+			protocol = int(v)
+		case int32:
+			protocol = int(v)
+		default:
+			return newErr(ErrTransport, "malformed version response")
+		}
+		if server == "" {
+			return newErr(ErrTransport, "malformed version response")
+		}
+		return CheckCompat(server, protocol)
+	}
 }
 
 func (c *Client) okRows(resp Response) ([]Row, error) {

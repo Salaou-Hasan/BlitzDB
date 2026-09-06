@@ -38,6 +38,12 @@ export interface ClientOptions {
 }
 
 const DEFAULT_TIMEOUT_MS = 5000;
+/** Minimum server release this SDK speaks to (§35). */
+export const MIN_SERVER_VERSION = '0.1.0';
+/** Wire protocol this SDK speaks (must match the server exactly). */
+export const PROTOCOL_VERSION_TS = 2;
+/** SDK release (mirrors package.json; checked in tests). */
+export const CLIENT_VERSION = '0.1.0';
 /** Hard cap per flush frame (protocol bound; larger drains chunk). */
 export const MAX_FLUSH_OPS = 4096;
 /** Target ops per batch frame (bounds head-of-line wait inside a frame). */
@@ -64,15 +70,43 @@ export class Client {
     socket.on('error', () => {});
   }
 
-  static connect(port: number, host = '127.0.0.1', opts: ClientOptions = {}): Promise<Client> {
+  static async connect(port: number, host = '127.0.0.1', opts: ClientOptions = {}): Promise<Client> {
     const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    return new Promise((resolve, reject) => {
-      const socket = net.connect(port, host, () => {
-        socket.setNoDelay(true);
-        resolve(new Client(socket, host, port, timeoutMs));
+    const socket = await new Promise<net.Socket>((resolve, reject) => {
+      const s = net.connect(port, host, () => {
+        s.setNoDelay(true);
+        resolve(s);
       });
-      socket.once('error', reject);
+      s.once('error', reject);
     });
+    // Compatibility handshake first (§35): one RTT that turns version
+    // skew into a readable error instead of later garbage.
+    await checkWireCompat(socket, timeoutMs);
+    return new Client(socket, host, port, timeoutMs);
+  }
+
+  /** Parse `major.minor.patch` (ignores pre-release/build metadata). */
+  static parseVersion(v: string): [number, number, number] | null {
+    const core = v.split(/[-+]/)[0];
+    const parts = core.split('.');
+    if (parts.length < 3) return null;
+    const nums = parts.slice(0, 3).map((x) => (/^\d+$/.test(x) ? parseInt(x, 10) : NaN));
+    if (nums.some((n) => Number.isNaN(n))) return null;
+    return nums as [number, number, number];
+  }
+
+  /** Compatibility verdict (§35): exact protocol match plus server floor. */
+  static checkCompat(server: string, protocol: number): void {
+    if (protocol !== PROTOCOL_VERSION_TS) {
+      throw new SdkError('Server',
+        `BlitzDB client v${CLIENT_VERSION} (protocol ${PROTOCOL_VERSION_TS}) requires server protocol ${PROTOCOL_VERSION_TS} (server v${server} speaks v${protocol})`);
+    }
+    const floor = Client.parseVersion(MIN_SERVER_VERSION) ?? [0, 1, 0];
+    const got = Client.parseVersion(server);
+    if (!got || compareTuples(got, floor) < 0) {
+      throw new SdkError('Server',
+        `BlitzDB client v${CLIENT_VERSION} requires BlitzDB server >= ${MIN_SERVER_VERSION} (found ${server})`);
+    }
   }
 
   close(): void {
@@ -341,4 +375,70 @@ export class Client {
     };
     return this.okRows(await this.enqueue(req, true, false));
   }
+}
+
+function compareTuples(a: [number, number, number], b: [number, number, number]): number {
+  for (let i = 0; i < 3; i++) {
+    if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** One-shot version handshake on a fresh socket (pre-worker). */
+function checkWireCompat(socket: net.Socket, timeoutMs: number): Promise<void> {
+  const codec = new FrameCodec();
+  const frame = codec.encodeRequest({ id: 0, op: 'version', table: '' });
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new SdkError('Timeout', `version check timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off('data', onData);
+      socket.off('error', onError);
+      socket.off('close', onClose);
+    };
+    const onData = (chunk: Buffer) => {
+      try {
+        // Feed only new bytes: the codec stashes internally across reads.
+        const payloads = codec.feed(chunk);
+        if (payloads.length === 0) return;
+        cleanup();
+        const resp = codec.decodeResponse(payloads[0]);
+        if (!resp.ok) {
+          reject(new SdkError('Transport', `version refused: ${resp.error ?? ''}`));
+          return;
+        }
+        const row = resp.rows[0];
+        if (!row) {
+          reject(new SdkError('Transport', 'empty version response'));
+          return;
+        }
+        const server = typeof row.values['server'] === 'string' ? (row.values['server'] as string) : '';
+        const protocol = typeof row.values['protocol'] === 'number' ? (row.values['protocol'] as number) : NaN;
+        if (!server || Number.isNaN(protocol)) {
+          reject(new SdkError('Transport', 'malformed version response'));
+          return;
+        }
+        try {
+          Client.checkCompat(server, protocol);
+          resolve();
+        } catch (e) {
+          reject(e);
+        }
+      } catch (e) {
+        cleanup();
+        reject(e);
+      }
+    };
+    const onError = (e: Error) => { cleanup(); reject(new SdkError('Transport', `version check: ${String(e)}`)); };
+    const onClose = () => { cleanup(); reject(new SdkError('Transport', 'closed during version check')); };
+    socket.on('data', onData);
+    socket.once('error', onError);
+    socket.once('close', onClose);
+    socket.write(frame, (e) => {
+      if (e) { cleanup(); reject(new SdkError('Transport', `version write: ${String(e)}`)); }
+    });
+  });
 }
