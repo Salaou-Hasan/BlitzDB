@@ -287,6 +287,14 @@ mod tests {
         let mut job = Job::new("echo");
         run_job(&ex, &mut job, &module, "payload").unwrap();
         assert_eq!(job.result.as_deref(), Some("payload"));
+    }
+
+    // Same Windows fuel-trap abort as `infinite_loop_dies_on_fuel` (any
+    // fuel exhaustion aborts the process there; Linux/macOS map it).
+    #[cfg_attr(target_os = "windows", ignore)]
+    #[test]
+    fn job_lifecycle_fuel_failure() {
+        use crate::job::Job;
         let mut bad = Job::new("loop");
         let err = run_job(
             &WasmExecutor::with_limits(1_000, DEFAULT_MEMORY_MAX).unwrap(),
