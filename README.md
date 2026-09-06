@@ -18,7 +18,19 @@ define tables, write functions, build your app
 
 ## Install (prebuilt binaries, no source build)
 
-Releases carry one binary per supported device plus checksums:
+One-liners (checksums verified, PATH wired automatically):
+
+```bash
+# macOS / Linux
+curl -sSf https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.1/scripts/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+iwr https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.1/scripts/install.ps1 -useb | iex
+```
+
+Or pick your device from the release (checksums included):
 https://github.com/Salaou-Hasan/BlitzDB/releases
 
 | Device | Download | Or via CLI |

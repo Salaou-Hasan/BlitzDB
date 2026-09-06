@@ -61,3 +61,12 @@ Manual equivalent per device: download the asset +
 `install` also wires PATH (idempotent marker block in shell profiles,
 fish included; Windows User environment via PowerShell — never `setx`,
 which truncates). PATH failures warn, never fail the install.
+### Release checklist (do not skip)
+
+- [ ] Versions aligned (workspace + all SDK `CLIENT_VERSION`s; floors stay).
+- [ ] One-liner tags bumped to the new tag in `README.md`,
+      `scripts/install.sh` header comment, `scripts/install.ps1` header
+      comment (raw URLs pin the tag — stale pins install stale code).
+- [ ] `git tag vX.Y.Z && git push origin vX.Y.Z`, then watch the
+      release run green and confirm all four assets + `SHA256SUMS`.
+- [ ] Spot-check one install path live (curl|sh or `blitz install`).
