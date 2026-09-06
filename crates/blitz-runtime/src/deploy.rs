@@ -94,13 +94,13 @@ fn transform_step(step: &mut serde_json::Value) -> Result<(), String> {
         return Ok(());
     }
     let body_obj = obj.get_mut(&variant).and_then(|b| b.as_object_mut()).unwrap();
-    let mut field = |body_obj: &mut serde_json::Map<String, serde_json::Value>, name: &str| -> Result<(), String> {
+    let field = |body_obj: &mut serde_json::Map<String, serde_json::Value>, name: &str| -> Result<(), String> {
         if let Some(f) = body_obj.get_mut(name) {
             *f = transform_value(std::mem::take(f))?;
         }
         Ok(())
     };
-    let mut map_field = |body_obj: &mut serde_json::Map<String, serde_json::Value>, name: &str| -> Result<(), String> {
+    let map_field = |body_obj: &mut serde_json::Map<String, serde_json::Value>, name: &str| -> Result<(), String> {
         if let Some(m) = body_obj.get_mut(name) {
             let map = m.as_object_mut().ok_or(format!("{}.{} must be an object", variant, name))?;
             for (_, v) in map.iter_mut() {

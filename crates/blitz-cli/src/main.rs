@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 
 mod compat;
+mod dev;
 
 #[derive(Parser)]
 #[command(
@@ -136,6 +137,27 @@ enum Commands {
 
     /// Show performance metrics
     Metrics,
+
+    /// Local development: server + HTTP bridge + procedure hot-reload.
+    /// Watches <dir>/procedures/*.json deploy envelopes and redeploys
+    /// on save. In-memory dev defaults; Ctrl-C stops.
+    Dev {
+        /// Project directory (reads blitz.project.json when present)
+        #[arg(default_value = ".")]
+        dir: String,
+
+        /// TCP port for the BlitzDB protocol
+        #[arg(long, default_value_t = 7420)]
+        port: u16,
+
+        /// HTTP port for the JSON bridge (/v1/*, SSE)
+        #[arg(long, default_value_t = 7421)]
+        http_port: u16,
+
+        /// Procedures directory to watch (default: <dir>/procedures)
+        #[arg(long)]
+        procedures: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -359,6 +381,16 @@ async fn main() -> Result<()> {
                 server_version,
                 protocol,
                 yes,
+            })
+            .await?;
+        }
+
+        Commands::Dev { dir, port, http_port, procedures } => {
+            dev::run_dev(dev::DevArgs {
+                dir: PathBuf::from(dir),
+                port,
+                http_port,
+                procedures: procedures.map(PathBuf::from),
             })
             .await?;
         }
