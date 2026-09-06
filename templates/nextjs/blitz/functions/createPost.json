@@ -1,0 +1,25 @@
+{
+  "v": 1,
+  "procedure": {
+    "name": "createPost",
+    "description": "Validated micro-post insert (empty bodies rejected).",
+    "steps": [
+      {
+        "If": {
+          "condition": { "IsNotNull": "body" },
+          "then_steps": [
+            {
+              "Insert": {
+                "table": "posts",
+                "values": { "owner": "$owner", "body": "$body" },
+                "into": "post_id"
+              }
+            },
+            { "Return": { "value": "$post_id" } }
+          ],
+          "else_steps": [{ "Fail": { "message": "empty post" } }]
+        }
+      }
+    ]
+  }
+}

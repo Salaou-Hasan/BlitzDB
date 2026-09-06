@@ -32,7 +32,6 @@ Honesty rules (deliberate limits, not oversights):
 - Reruns are byte-identical (tested); the manifest fingerprints inputs
   for the audit trail (FNV-1a hex: determinism only — `--check`
   compares full bytes anyway).
-- `blitz dev` watches a different tree (`<dir>/procedures/*.json`
-  envelopes deployed live). A future pass may unify `blitz/functions`
-  as the single source feeding both `generate` and `dev --watch`;
-  until then the two stay explicit and independent.
+- `blitz dev` watches the same tree (`<dir>/blitz/functions/*.json`,
+  overridable with `--procedures`) and hot-redeploys on save: one source
+  of truth feeds authoring, generation, and live reload.

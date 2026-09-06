@@ -1,7 +1,7 @@
 //! `blitz dev`: local development environment in one command.
 //!
 //! Starts an in-process server (TCP + HTTP bridge), loads
-//! `<project>/procedures/*.json` deploy envelopes, and redeploys on save
+//! `<project>/blitz/functions/*.json` deploy envelopes, and redeploys on save
 //! (500ms mtime poll — zero new dependencies, robust over network mounts).
 //! Prints addresses, project pins, and per-procedure results; Ctrl-C stops.
 //!
@@ -72,18 +72,19 @@ pub async fn run_dev(args: DevArgs) -> Result<()> {
     println!("HTTP bridge on http://127.0.0.1:{}/v1/op", args.http_port);
     println!("database: in-memory (dev defaults; use --help for data-dir plans)");
 
-    // Procedures directory: explicit flag or <project>/procedures.
+    // Procedures directory: explicit flag or <project>/blitz/functions
+    // (the same tree `blitz generate` reads — one source of truth).
     let proc_dir = args
         .procedures
         .clone()
-        .unwrap_or_else(|| args.dir.join("procedures"));
+        .unwrap_or_else(|| args.dir.join("blitz").join("functions"));
     let mut watched: Watched = HashMap::new();
     if proc_dir.is_dir() {
         println!("watching procedures in {}", proc_dir.display());
         initial_load(&server, &proc_dir, &mut watched);
     } else {
         println!(
-            "no procedures directory ({} missing) — drop *.json deploy envelopes there to auto-deploy",
+            "no functions directory ({} missing) — drop *.json deploy envelopes under blitz/functions/ to auto-deploy",
             proc_dir.display()
         );
     }

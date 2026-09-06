@@ -43,7 +43,7 @@ export const MIN_SERVER_VERSION = '0.1.0';
 /** Wire protocol this SDK speaks (must match the server exactly). */
 export const PROTOCOL_VERSION_TS = 2;
 /** SDK release (mirrors package.json; checked in tests). */
-export const CLIENT_VERSION = '0.1.0';
+export const CLIENT_VERSION = '0.2.0';
 /** Hard cap per flush frame (protocol bound; larger drains chunk). */
 export const MAX_FLUSH_OPS = 4096;
 /** Target ops per batch frame (bounds head-of-line wait inside a frame). */

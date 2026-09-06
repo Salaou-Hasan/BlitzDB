@@ -153,8 +153,9 @@ enum Commands {
         check: bool,
     },
     /// Local development: server + HTTP bridge + procedure hot-reload.
-    /// Watches <dir>/procedures/*.json deploy envelopes and redeploys
-    /// on save. In-memory dev defaults; Ctrl-C stops.
+    /// Watches <dir>/blitz/functions/*.json deploy envelopes and redeploys
+    /// on save (same tree `blitz generate` reads). In-memory dev defaults;
+    /// Ctrl-C stops.
     Dev {
         /// Project directory (reads blitz.project.json when present)
         #[arg(default_value = ".")]
@@ -168,7 +169,7 @@ enum Commands {
         #[arg(long, default_value_t = 7421)]
         http_port: u16,
 
-        /// Procedures directory to watch (default: <dir>/procedures)
+        /// Procedures directory to watch (default: <dir>/blitz/functions)
         #[arg(long)]
         procedures: Option<PathBuf>,
     },

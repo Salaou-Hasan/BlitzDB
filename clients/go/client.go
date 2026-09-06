@@ -14,7 +14,7 @@ const (
 	// DefaultTimeout bounds one call (queue + service).
 	DefaultTimeout = 5 * time.Second
 	// ClientVersion mirrors the SDK release (§35 messages).
-	ClientVersion = "0.1.0"
+	ClientVersion = "0.2.0"
 	// MinServerVersion is the floor this SDK speaks to (§35).
 	MinServerVersion = "0.1.0"
 	// ProtocolVersionGo must match the server exactly.
