@@ -949,6 +949,7 @@ impl BlitzServer {
             Op::ProcDeploy => Permission::Custom("proc.deploy".to_string()),
             Op::ProcList => Permission::Custom("proc.list".to_string()),
             Op::ProcDrop => Permission::Custom("proc.drop".to_string()),
+            Op::TableCreate => Permission::Custom("table.create".to_string()),
             Op::Ping | Op::Version => return Ok(()),
         };
         let id = ident.as_ref().ok_or("unauthorized: authentication required")?;

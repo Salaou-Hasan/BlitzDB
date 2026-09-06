@@ -56,6 +56,11 @@ pub enum Op {
     /// one row `{server, protocol}`. SDKs call this at connect and fail
     /// fast on mismatch (clear errors, never mysterious decode failures).
     Version,
+    /// Create a table: `values {schema: Json{table, columns:[{name, type,
+    /// pk?, unique?, nullable?}]}}`. Types: bool/int8..64/uint8..64/
+    /// float32/float64/decimal/string/bytes/uuid/timestamp/date/json/array.
+    /// Existing tables err (no silent replace). Needs `table.create`.
+    TableCreate,
 }
 
 impl Op {
@@ -77,6 +82,7 @@ impl Op {
             Op::ProcList => 13,
             Op::ProcDrop => 14,
             Op::Version => 15,
+            Op::TableCreate => 16,
         }
     }
 
@@ -98,6 +104,7 @@ impl Op {
             13 => Some(Op::ProcList),
             14 => Some(Op::ProcDrop),
             15 => Some(Op::Version),
+            16 => Some(Op::TableCreate),
             _ => None,
         }
     }
@@ -208,11 +215,12 @@ mod tests {
             (Op::ProcList, 13),
             (Op::ProcDrop, 14),
             (Op::Version, 15),
+            (Op::TableCreate, 16),
         ] {
             assert_eq!(op.tag(), tag);
             assert_eq!(Op::from_tag(tag), Some(op));
         }
-        assert_eq!(Op::from_tag(16), None);
+        assert_eq!(Op::from_tag(17), None);
         assert_eq!(Op::from_tag(255), None);
     }
 

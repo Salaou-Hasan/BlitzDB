@@ -27,7 +27,7 @@ OP_TO_TAG = {
     "scan": 5, "subscribe": 6, "find": 7, "search": 8, "call": 9,
     "job_submit": 10, "job_poll": 11,
     "proc_deploy": 12, "proc_list": 13, "proc_drop": 14,
-    "version": 15,
+    "version": 15, "table_create": 16,
 }
 TAG_TO_OP = {v: k for k, v in OP_TO_TAG.items()}
 

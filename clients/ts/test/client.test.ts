@@ -63,6 +63,21 @@ describe('client', { skip: !haveServer && 'Blitz binary missing (cargo build -p 
     assert.equal(MIN_SERVER_VERSION, '0.1.0');
   });
 
+  it('createTable then use', async () => {
+    const c = await Client.connect(port);
+    try {
+      const name = await c.createTable({
+        table: 'ts_t',
+        columns: [{ name: 'id', type: 'int64' }, { name: 'v', type: 'string', nullable: true }],
+      });
+      assert.equal(name, 'ts_t');
+      const row = await c.insertFast('ts_t', { id: 1 });
+      assert.ok(row.id);
+    } finally {
+      c.close();
+    }
+  });
+
   it('crud roundtrip', async () => {
     const c = await Client.connect(port);
     try {

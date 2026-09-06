@@ -278,6 +278,28 @@ pub(crate) fn dispatch(server: &std::sync::Arc<BlitzServer>, authed: &Option<bli
             values.insert("protocol".to_string(), Value::Int64(blitz_protocol::PROTOCOL_VERSION as i64));
             Response::ok(id, vec![RowView { id: 0, values }])
         }
+        Op::TableCreate => {
+            // values {schema: Json{table, columns:[...]}}. DDL is immediate
+            // and unversioned (no rollback possible — rejected in atomic
+            // frames); existing tables err instead of replacing.
+            let schema_json = match req.values.as_ref().and_then(|m| m.get("schema")) {
+                Some(Value::Json(j)) => j.clone(),
+                _ => return Response::err(id, "table_create requires values {schema: Json}"),
+            };
+            let schema = match blitz_types::schema::TableSchema::from_json(&schema_json) {
+                Ok(s) => s,
+                Err(e) => return Response::err(id, format!("invalid schema: {}", e)),
+            };
+            let name = schema.name.clone();
+            match server.engine().create_table(schema) {
+                Ok(()) => {
+                    let mut out = std::collections::HashMap::new();
+                    out.insert("table".to_string(), Value::String(name));
+                    Response::ok(id, vec![RowView { id: 0, values: out }])
+                }
+                Err(e) => Response::err(id, e.to_string()),
+            }
+        }
         Op::Insert => {
             let mut values = match req.values {
                 Some(v) => v,
@@ -836,7 +858,7 @@ pub(crate) fn execute_atomic(
         // Snapshot ops would read outside tx versioning, nested Calls
         // would nest transactions, and job ops spawn background work that
         // can't roll back: reject, don't fake.
-        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop | Op::Version) {
+        if matches!(op.op, Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop | Op::Version | Op::TableCreate) {
             return abort_all(format!(
                 "atomic batch aborted: {:?} not supported in atomic batch",
                 op.op
@@ -1023,7 +1045,7 @@ pub(crate) fn execute_atomic(
                 let (shard, _) = BlitzServer::split_id(global);
                 buffered.push((rid, Buffered::Delete { base: op.table, physical, shard, local: local_id, global }));
             }
-            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop | Op::Version => {
+            Op::Scan | Op::Find | Op::Subscribe | Op::Search | Op::Call | Op::JobSubmit | Op::JobPoll | Op::ProcDeploy | Op::ProcList | Op::ProcDrop | Op::Version | Op::TableCreate => {
                 return fail(&mut tx, rid, format!("{:?} not supported in atomic batch", op.op))
             }
         }
@@ -5043,6 +5065,68 @@ mod tests {
         .await
         .unwrap();
         assert!(b.results.iter().all(|x| !x.ok), "version must abort atomic: {:?}", b.results);
+    }
+
+    #[tokio::test]
+    async fn test_table_create_insert_duplicate() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
+        let schema = serde_json::json!({
+            "table": "widgets",
+            "columns": [
+                {"name": "id", "type": "int64"},
+                {"name": "owner", "type": "string", "nullable": true},
+            ]
+        });
+        // Create via JSON envelope.
+        let r = client
+            .roundtrip(&Request {
+                id: 1,
+                op: Op::TableCreate,
+                table: "".into(),
+                row_id: None,
+                values: Some(values(&[("schema", Value::Json(schema))])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "create failed: {:?}", r.error);
+        // Usable immediately: insert + get.
+        let r = client
+            .roundtrip(&Request {
+                id: 2,
+                op: Op::Insert,
+                table: "widgets".into(),
+                row_id: None,
+                values: Some(values(&[("id", Value::Int64(1))])),
+            })
+            .await
+            .unwrap();
+        assert!(r.ok, "insert failed: {:?}", r.error);
+        // Duplicate create errors honestly (no silent replace).
+        let r = client
+            .roundtrip(&Request {
+                id: 3,
+                op: Op::TableCreate,
+                table: "".into(),
+                row_id: None,
+                values: Some(values(&[("schema", Value::Json(serde_json::json!({
+                    "table": "widgets", "columns": [{"name": "id", "type": "int64"}]
+                })))])),
+            })
+            .await
+            .unwrap();
+        assert!(!r.ok && r.error.as_deref().unwrap_or("").contains("already exists"), "got {:?}", r);
+        // Atomic frames reject DDL (no rollback possible).
+        let b = roundtrip_atomic(&mut client, 50, vec![Request {
+            id: 51, op: Op::TableCreate, table: "".into(), row_id: None, values: None,
+        }])
+        .await
+        .unwrap();
+        assert!(b.results.iter().all(|x| !x.ok), "ddl must abort atomic: {:?}", b.results);
     }
 
     #[tokio::test]

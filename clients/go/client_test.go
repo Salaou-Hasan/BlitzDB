@@ -79,6 +79,26 @@ func dial(t *testing.T) *Client {
 	return c
 }
 
+func TestCreateTable(t *testing.T) {
+	c := dial(t)
+	name, err := c.CreateTable(map[string]any{
+		"table": "go_t",
+		"columns": []any{
+			map[string]any{"name": "id", "type": "int64"},
+			map[string]any{"name": "v", "type": "string", "nullable": true},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if name != "go_t" {
+		t.Fatalf("name: %s", name)
+	}
+	if _, err := c.Insert("go_t", map[string]any{"id": int64(1)}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+}
+
 func TestCRUDRoundtrip(t *testing.T) {
 	c := dial(t)
 	if err := c.Ping(); err != nil {

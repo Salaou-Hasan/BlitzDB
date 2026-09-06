@@ -347,6 +347,23 @@ export class Client {
 
   /** Execute a registered procedure transactionally. Not auto-retried:
    * design procedures around an application `_idem` argument instead. */
+  /** Create a table from a JSON schema `{table, columns:[...]}`.
+   * DDL is immediate and never auto-retried (a retried-after-success call
+   * honestly reports "already exists"). */
+  async createTable(schema: unknown): Promise<string> {
+    const req: Request = {
+      id: this.allocId(), op: 'table_create', table: '',
+      values: { schema: schema as Value },
+    };
+    const rows = this.okRows(await this.enqueue(req, false, false));
+    const row = rows.pop();
+    const name = row?.values['table'];
+    if (typeof name !== 'string') throw new SdkError('Server', 'table_create response missing table');
+    return name;
+  }
+
+  /** Execute a registered procedure transactionally. Not auto-retried:
+   * design procedures around an application `_idem` argument instead. */
   async call(fn: string, args: Record<string, Value>): Promise<CallResult> {
     const req: Request = { id: this.allocId(), op: 'call', table: `fn:${fn}`, values: args };
     const rows = this.okRows(await this.enqueue(req, false, false));

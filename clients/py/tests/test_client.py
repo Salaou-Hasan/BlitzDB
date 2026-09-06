@@ -48,6 +48,19 @@ class TestClient(unittest.TestCase):
     def tearDownClass(cls) -> None:
         cls.proc.kill()
 
+    def test_create_table(self) -> None:
+        c = Client.connect(self.port)
+        try:
+            name = c.create_table({"table": "py_t", "columns": [
+                {"name": "id", "type": "int64"},
+                {"name": "v", "type": "string", "nullable": True},
+            ]})
+            self.assertEqual(name, "py_t")
+            row = c.insert("py_t", {"id": 1})
+            self.assertIsNotNone(row)
+        finally:
+            c.close()
+
     def test_crud_roundtrip(self) -> None:
         c = Client.connect(self.port)
         try:

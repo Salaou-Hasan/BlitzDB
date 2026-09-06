@@ -1,0 +1,11 @@
+{
+  "manifest": 1,
+  "name": "nextjs",
+  "version": "0.1.0",
+  "language": "typescript",
+  "framework": "nextjs",
+  "description": "Next.js App Router + BlitzDB: RSC list, Server Action mutations via procedures, live SSE feed.",
+  "sdk": { "name": "@blitzdb/client", "range": ">=0.1.0, <1.0.0" },
+  "protocol": { "min": 2, "max": 2 },
+  "server": { "min": "0.1.0" }
+}

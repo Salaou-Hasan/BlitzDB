@@ -406,6 +406,19 @@ class Client:
                "values": {"_q": query, "_limit": limit}}
         return self._ok_rows(self._exec(req, True))
 
+    def create_table(self, schema: dict) -> str:
+        """Create a table from a JSON schema dict. Never auto-retried:
+        a retried-after-success call honestly reports "already exists"."""
+        req = {"id": self._alloc_id(), "op": "table_create",
+               "values": {"schema": schema}}
+        rows = self._ok_rows(self._exec(req, False))
+        if not rows:
+            raise SdkError(SdkError.SERVER, "table_create returned no rows")
+        name = rows[-1]["values"].get("table")
+        if not isinstance(name, str):
+            raise SdkError(SdkError.SERVER, "table_create response missing table")
+        return name
+
     def call(self, fn: str, args: dict) -> dict:
         """Execute a registered procedure transactionally. Not auto-retried:
         design procedures around an application ``_idem`` argument."""

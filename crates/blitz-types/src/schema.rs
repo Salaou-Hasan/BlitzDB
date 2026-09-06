@@ -34,6 +34,76 @@ impl TableSchema {
         self
     }
 
+    /// Build a schema from the `table_create` JSON shape:
+    /// `{table, columns:[{name, type, pk?, unique?, nullable?}]}`.
+    /// Types: bool/int8/int16/int32/int64/uint8/uint16/uint32/uint64/
+    /// float32/float64/decimal/string/bytes/uuid/timestamp/date/json/array.
+    /// Columns default non-nullable; validation caps sizes (anti-DoS).
+    pub fn from_json(v: &serde_json::Value) -> Result<Self, String> {
+        use super::column::{ColumnDef, ColumnType};
+        let obj = v.as_object().ok_or("schema must be a JSON object")?;
+        let table = obj
+            .get("table")
+            .and_then(|t| t.as_str())
+            .ok_or("schema missing string 'table'")?;
+        if table.is_empty() || table.len() > 128 {
+            return Err("table name must be 1..=128 chars".into());
+        }
+        let cols = obj
+            .get("columns")
+            .and_then(|c| c.as_array())
+            .ok_or("schema missing array 'columns'")?;
+        if cols.is_empty() || cols.len() > 256 {
+            return Err("columns must list 1..=256 entries".into());
+        }
+        let mut schema = TableSchema::new(table);
+        for (i, c) in cols.iter().enumerate() {
+            let co = c.as_object().ok_or(format!("columns[{}] must be an object", i))?;
+            let name = co
+                .get("name")
+                .and_then(|n| n.as_str())
+                .ok_or(format!("columns[{}] missing string 'name'", i))?;
+            if name.is_empty() || name.len() > 128 {
+                return Err(format!("columns[{}].name must be 1..=128 chars", i));
+            }
+            let ctype = match co.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                "bool" | "boolean" => ColumnType::Boolean,
+                "int8" => ColumnType::Int8,
+                "int16" => ColumnType::Int16,
+                "int32" => ColumnType::Int32,
+                "int64" => ColumnType::Int64,
+                "uint8" => ColumnType::UInt8,
+                "uint16" => ColumnType::UInt16,
+                "uint32" => ColumnType::UInt32,
+                "uint64" => ColumnType::UInt64,
+                "float32" => ColumnType::Float32,
+                "float64" => ColumnType::Float64,
+                "decimal" => ColumnType::Decimal,
+                "string" => ColumnType::String,
+                "bytes" => ColumnType::Bytes,
+                "uuid" => ColumnType::Uuid,
+                "timestamp" => ColumnType::Timestamp,
+                "date" => ColumnType::Date,
+                "json" => ColumnType::Json,
+                "array" => ColumnType::Array,
+                other => return Err(format!("columns[{}] unknown type {:?}", i, other)),
+            };
+            let flag = |key: &str| co.get(key).and_then(|b| b.as_bool()).unwrap_or(false);
+            let mut def = ColumnDef::new(name, ctype);
+            if flag("nullable") {
+                def = def.nullable();
+            }
+            if flag("pk") {
+                def = def.primary_key();
+            }
+            if flag("unique") {
+                def = def.unique();
+            }
+            schema = schema.with_column(def);
+        }
+        Ok(schema)
+    }
+
     pub fn column(&self, name: &str) -> TypeResult<&ColumnDef> {
         self.column_index
             .get(name)
@@ -166,5 +236,43 @@ impl Schema {
             .iter_mut()
             .find(|t| t.name == name)
             .ok_or_else(|| TypeError::SchemaError(format!("table '{}' not found", name)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn from_json_happy_path() {
+        let schema = TableSchema::from_json(&json!({
+            "table": "posts",
+            "columns": [
+                {"name": "id", "type": "int64"},
+                {"name": "owner", "type": "string", "nullable": true},
+                {"name": "email", "type": "string", "unique": true},
+                {"name": "score", "type": "float64", "nullable": true},
+            ]
+        }))
+        .unwrap();
+        assert_eq!(schema.name, "posts");
+        assert_eq!(schema.columns.len(), 4);
+        assert!(schema.column("email").unwrap().unique);
+        assert!(schema.column("owner").unwrap().nullable);
+        assert!(!schema.column("id").unwrap().nullable);
+    }
+
+    #[test]
+    fn from_json_rejects_garbage() {
+        for bad in [
+            json!({}),
+            json!({"table": "", "columns": []}),
+            json!({"table": "t", "columns": []}),
+            json!({"table": "t", "columns": [{"name": "a", "type": "nope"}]}),
+            json!({"table": "t", "columns": [{"name": "", "type": "int64"}]}),
+        ] {
+            assert!(TableSchema::from_json(&bad).is_err(), "accepted {:?}", bad);
+        }
     }
 }

@@ -272,6 +272,22 @@ impl Client {
 
     /// Execute a registered procedure transactionally. Not auto-retried:
     /// design procedures around an application `_idem` argument instead.
+    /// Create a table from a JSON schema `{table, columns:[{name, type,
+    /// pk?, unique?, nullable?}]}` (see `TableSchema::from_json`). DDL is
+    /// immediate and never auto-retried: a retried-after-success call
+    /// honestly reports "already exists".
+    pub async fn create_table(&self, schema: serde_json::Value) -> SdkResult<String> {
+        let mut values = HashMap::new();
+        values.insert("schema".to_string(), Value::Json(schema));
+        let req = Request { id: self.alloc_id(), op: Op::TableCreate, table: String::new(), row_id: None, values: Some(values) };
+        let mut rows = self.ok_rows(self.exec(req, false).await?)?;
+        let row = rows.pop().ok_or_else(|| SdkError::Server("table_create returned no rows".into()))?;
+        match row.values.get("table") {
+            Some(Value::String(t)) => Ok(t.clone()),
+            _ => Err(SdkError::Server("table_create response missing table".into())),
+        }
+    }
+
     pub async fn call(&self, name: &str, args: HashMap<String, Value>) -> SdkResult<CallResult> {
         let req = Request {
             id: self.alloc_id(),
@@ -624,6 +640,20 @@ mod tests {
         assert!(err.to_string().contains("requires BlitzDB server >="), "got {}", err);
         // Garbage versions fail closed, not panicked.
         assert!(check_compat("banana", blitz_protocol::PROTOCOL_VERSION).is_err());
+    }
+
+    #[tokio::test]
+    async fn sdk_create_table() {
+        let (addr, _srv) = test_server().await;
+        let c = Client::connect(addr).await.unwrap();
+        let schema = serde_json::json!({
+            "table": "sdk_t",
+            "columns": [{"name": "id", "type": "int64"}, {"name": "v", "type": "string", "nullable": true}]
+        });
+        assert_eq!(c.create_table(schema).await.unwrap(), "sdk_t");
+        let mut values = HashMap::new();
+        values.insert("id".into(), Value::Int64(1));
+        c.insert("sdk_t", values).await.unwrap();
     }
 
     #[tokio::test]

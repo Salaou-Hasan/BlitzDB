@@ -140,6 +140,14 @@ jobs:
             --server-version 0.1.0 --protocol 2 --yes
           test -f /tmp/ci-proj/blitz.project.json
           test -f /tmp/ci-proj/src/index.ts
+          rm -rf /tmp/ci-next
+          ./target/debug/Blitz init /tmp/ci-next \
+            --templates templates --template nextjs \
+            --sdk-version @blitzdb/client=0.1.0 \
+            --server-version 0.1.0 --protocol 2 --yes
+          test -f /tmp/ci-next/blitz.project.json
+          test -f /tmp/ci-next/app/page.tsx
+          test -f /tmp/ci-next/scripts/seed.mjs
       - name: init rejects incompatible matrix
         run: |
           rm -rf /tmp/ci-proj2

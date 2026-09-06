@@ -4,6 +4,12 @@
   "description": "Reference TypeScript SDK for BlitzDB: invisible autobatching, auto-idempotency, typed errors",
   "type": "module",
   "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./http": "./src/http.ts",
+    "./tcp": "./src/client.ts",
+    "./package.json": "./package.json"
+  },
   "scripts": {
     "test": "node --test 'test/*.test.ts'"
   },

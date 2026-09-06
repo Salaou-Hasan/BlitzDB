@@ -657,6 +657,30 @@ func (c *Client) Search(table, query string, limit int) ([]Row, error) {
 	return c.okRows(resp)
 }
 
+// CreateTable creates a table from a JSON schema map. Never
+// auto-retried: a retried-after-success call honestly reports
+// "already exists".
+func (c *Client) CreateTable(schema map[string]any) (string, error) {
+	r := c.req(OpTableCreate, "")
+	r.Values = map[string]any{"schema": schema}
+	resp, err := c.exec(r, false, false)
+	if err != nil {
+		return "", err
+	}
+	rows, err := c.okRows(resp)
+	if err != nil {
+		return "", err
+	}
+	if len(rows) == 0 {
+		return "", newErr(ErrServer, "table_create returned no rows")
+	}
+	name, _ := rows[len(rows)-1].Values["table"].(string)
+	if name == "" {
+		return "", newErr(ErrServer, "table_create response missing table")
+	}
+	return name, nil
+}
+
 // Call executes a registered procedure transactionally. Not auto-retried:
 // design procedures around an application _idem argument instead.
 func (c *Client) Call(fn string, args map[string]any) (CallResult, error) {

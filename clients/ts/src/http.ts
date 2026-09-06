@@ -229,6 +229,16 @@ export class HttpClient {
     return this.rowsOf(await this.callOp(body));
   }
 
+  /** Create a table from a JSON schema. Never auto-retried. */
+  async createTable(schema: unknown): Promise<string> {
+    const body: Record<string, unknown> = { id: this.nextId++, op: 'table_create', values: { schema } };
+    const rows = this.rowsOf(await this.callOp(body));
+    const row = rows.pop();
+    const name = row?.values['table'];
+    if (typeof name !== 'string') throw new SdkError('Server', 'table_create response missing table');
+    return name;
+  }
+
   async call(fn: string, args: Record<string, Value>): Promise<HttpCallResult> {
     const body: Record<string, unknown> = { id: this.nextId++, op: 'call', table: `fn:${fn}`, values: mapValues(args) };
     const rows = this.rowsOf(await this.callOp(body));

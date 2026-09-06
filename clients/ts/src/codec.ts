@@ -23,19 +23,19 @@ export type Op =
   | 'ping' | 'insert' | 'get' | 'update' | 'delete'
   | 'scan' | 'subscribe' | 'find' | 'search' | 'call'
   | 'job_submit' | 'job_poll' | 'proc_deploy' | 'proc_list' | 'proc_drop'
-  | 'version';
+  | 'version' | 'table_create';
 
 const OP_TO_TAG: Record<Op, number> = {
   ping: 0, insert: 1, get: 2, update: 3, delete: 4,
   scan: 5, subscribe: 6, find: 7, search: 8, call: 9,
   job_submit: 10, job_poll: 11, proc_deploy: 12, proc_list: 13, proc_drop: 14,
-  version: 15,
+  version: 15, table_create: 16,
 };
 const TAG_TO_OP: Record<number, Op> = {
   0: 'ping', 1: 'insert', 2: 'get', 3: 'update', 4: 'delete',
   5: 'scan', 6: 'subscribe', 7: 'find', 8: 'search', 9: 'call',
   10: 'job_submit', 11: 'job_poll', 12: 'proc_deploy', 13: 'proc_list', 14: 'proc_drop',
-  15: 'version',
+  15: 'version', 16: 'table_create',
 };
 
 export interface Request {

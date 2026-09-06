@@ -58,6 +58,7 @@ pub fn request_from_json(v: &serde_json::Value) -> Result<Request, String> {
         "proc_list" => Op::ProcList,
         "proc_drop" => Op::ProcDrop,
         "version" => Op::Version,
+        "table_create" => Op::TableCreate,
         _ => return Err(format!("unknown op: {}", opname)),
     };
     let id = obj
