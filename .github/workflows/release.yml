@@ -1,0 +1,120 @@
+# BlitzDB release: tag `vX.Y.Z` → tested binaries + checksums + notes.
+#
+# Vision §12–16 in one pipeline: never publish binaries that were not
+# produced here. Linux/Windows/macOS build NATIVELY (no cross toolchains
+# to rot). Template validation + SDK suites run before anything uploads.
+#
+# Manual runs (`workflow_dispatch`) do everything except the GitHub
+# Release upload (dry run). Crates.io/npm/PyPI publishing stays MANUAL
+# (registry tokens + human judgment, not CI secrets).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Tag must equal the workspace version — no silent version skew.
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag matches workspace version
+        run: |
+          TAG="${GITHUB_REF_NAME:-manual}"
+          if [ "$TAG" = "manual" ]; then
+            echo "manual run: skipping tag check"
+            exit 0
+          fi
+          VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          if [ "v$VER" != "$TAG" ]; then
+            echo "tag $TAG != workspace version v$VER" && exit 1
+          fi
+          echo "version $TAG ok"
+
+  # Full gate (same suites as CI) before any artifact builds.
+  gate:
+    needs: [version-check]
+    uses: ./.github/workflows/ci-gate.yml
+
+  build:
+    name: build (${{ matrix.name }})
+    needs: [gate]
+    strategy:
+      matrix:
+        include:
+          - { name: blitz-linux-x64, os: ubuntu-latest, bin: Blitz, asset: blitz-linux-x64 }
+          - { name: blitz-windows-x64, os: windows-latest, bin: Blitz.exe, asset: blitz-windows-x64.exe }
+          - { name: blitz-macos-arm64, os: macos-latest, bin: Blitz, asset: blitz-macos-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --locked --release -p blitz-cli
+      - name: template validation (offline flags)
+        shell: bash
+        run: |
+          rm -rf /tmp/rel-proj
+          BIN="target/release/${{ matrix.bin }}"
+          "$BIN" init /tmp/rel-proj \
+            --templates templates --template ts-minimal \
+            --sdk-version @blitzdb/client=0.1.0 \
+            --server-version 0.1.0 --protocol 2 --yes
+          test -f /tmp/rel-proj/blitz.project.json
+      - name: stage asset
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.asset }}
+          retention-days: 90
+
+  ts-pack:
+    name: typescript package
+    needs: [gate]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: pack (no publish — registries stay manual)
+        working-directory: clients/ts
+        run: npm pack --dry-run
+
+  publish:
+    name: publish release
+    needs: [build, ts-pack]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: |
+          cd dist
+          sha256sum blitz-* > SHA256SUMS
+          cat SHA256SUMS
+      - name: release
+        uses: softprops/action-gh-release@v6
+        with:
+          files: dist/*
+          generate_release_notes: true
+          body: |
+            ## Compatibility
+            See `docs/COMPATIBILITY.md` in this tag. SDKs check
+            `Op::Version` at connect and fail fast on skew.

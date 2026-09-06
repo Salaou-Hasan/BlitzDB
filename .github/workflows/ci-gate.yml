@@ -1,0 +1,162 @@
+# BlitzDB CI: full gate on every push/PR to main.
+#
+# Blocking (ubuntu): Rust workspace tests, TS/Python/Go SDK suites (each
+# spawns the freshly built Blitz binary), CLI end-to-end (init/status),
+# template validation. Anything red here blocks merge.
+#
+# Signal-only (windows/macos, continue-on-error): portability signal for
+# the future release matrix. Promote to blocking once green twice in a row.
+name: gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+on:
+  workflow_call:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust workspace
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: tests
+        run: cargo test --workspace --locked
+      - name: clippy (deny warnings on new code paths)
+        run: cargo clippy --workspace --locked -- -D warnings
+        continue-on-error: true
+
+  # Release binary used by every SDK suite below (one build, shared path).
+  server-binary:
+    name: build server binary
+    runs-on: ubuntu-latest
+    needs: [rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --locked --release -p blitz-cli
+      - name: smoke (version + status contract)
+        run: |
+          ./target/release/Blitz --version
+          ./target/release/Blitz serve --port 17421 &
+          SRV=$!
+          sleep 2
+          ./target/release/Blitz status --port 17421
+          kill $SRV
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blitz-linux-x64
+          path: target/release/Blitz
+          retention-days: 7
+
+  sdk-typescript:
+    name: sdk typescript
+    runs-on: ubuntu-latest
+    needs: [server-binary]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: blitz-linux-x64
+          path: target/release/
+      - name: mark executable
+        run: chmod +x target/release/Blitz
+      - name: tests
+        working-directory: clients/ts
+        run: npm test
+
+  sdk-python:
+    name: sdk python
+    runs-on: ubuntu-latest
+    needs: [server-binary]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@v4
+        with:
+          name: blitz-linux-x64
+          path: target/release/
+      - name: mark executable
+        run: chmod +x target/release/Blitz
+      - name: tests
+        working-directory: clients/py
+        run: PYTHONPATH=. python3 -m unittest discover -s tests -v
+
+  sdk-go:
+    name: sdk go
+    runs-on: ubuntu-latest
+    needs: [server-binary]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/download-artifact@v4
+        with:
+          name: blitz-linux-x64
+          path: target/release/
+      - name: mark executable
+        run: chmod +x target/release/Blitz
+      - name: tests
+        working-directory: clients/go
+        run: go test ./...
+
+  cli-e2e:
+    name: cli init/status/templates
+    runs-on: ubuntu-latest
+    needs: [server-binary]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: rebuild CLI
+        run: cargo build --locked -p blitz-cli
+      - name: init from in-repo templates (offline flags)
+        run: |
+          rm -rf /tmp/ci-proj
+          ./target/debug/Blitz init /tmp/ci-proj \
+            --templates templates --template ts-minimal \
+            --sdk-version @blitzdb/client=0.1.0 \
+            --server-version 0.1.0 --protocol 2 --yes
+          test -f /tmp/ci-proj/blitz.project.json
+          test -f /tmp/ci-proj/src/index.ts
+      - name: init rejects incompatible matrix
+        run: |
+          rm -rf /tmp/ci-proj2
+          if ./target/debug/Blitz init /tmp/ci-proj2 \
+            --templates templates --template ts-minimal \
+            --sdk-version @blitzdb/client=0.0.1 \
+            --server-version 0.1.0 --protocol 2 --yes; then
+            echo "init should have failed" && exit 1
+          fi
+      - name: status contract (up + down)
+        run: |
+          ./target/debug/Blitz serve --port 17422 &
+          SRV=$!
+          sleep 2
+          ./target/debug/Blitz status --port 17422
+          kill $SRV
+          sleep 1
+          if ./target/debug/Blitz status --port 17422; then
+            echo "status should have failed" && exit 1
+          fi

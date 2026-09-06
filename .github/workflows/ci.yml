@@ -1,0 +1,37 @@
+# BlitzDB CI: full gate on every push/PR to main.
+#
+# Blocking (ubuntu): Rust workspace tests, TS/Python/Go SDK suites (each
+# spawns the freshly built Blitz binary), CLI end-to-end (init/status),
+# template validation. Anything red here blocks merge.
+#
+# Signal-only (windows/macos, continue-on-error): portability signal for
+# the future release matrix. Promote to blocking once green twice in a row.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  gate:
+    uses: ./.github/workflows/ci-gate.yml
+
+  # Signal-only portability matrix (see header comment).
+  portability:
+    name: portability (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: workspace tests
+        run: cargo test --workspace --locked
