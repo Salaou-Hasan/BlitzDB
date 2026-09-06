@@ -159,11 +159,17 @@ pub fn run_install(args: InstallArgs) -> Result<PathBuf> {
         .ok_or_else(|| anyhow::anyhow!("SHA256SUMS has no entry for {}", asset))?;
 
     if dest.exists() && !args.force {
-        // Verified-idempotent: matching checksum means done already.
+        // Verified-idempotent: matching checksum means done already —
+        // but still ensure PATH (a cleaned rc file shouldn't strand us).
         if let Ok(have) = sha256_file(&dest) {
             if have == want {
                 println!("already installed: {} ({})", dest.display(), &want[..12]);
                 let _ = std::fs::remove_file(&sums_path);
+                match ensure_on_path(&dir) {
+                    Ok(true) => print_path_hint(&dir),
+                    Ok(false) => {}
+                    Err(e) => eprintln!("warning: PATH wiring skipped ({})", e),
+                }
                 return Ok(dest);
             }
         }
@@ -184,21 +190,221 @@ pub fn run_install(args: InstallArgs) -> Result<PathBuf> {
             have
         );
     }
-    std::fs::rename(&tmp, &dest)
-        .map_err(|e| anyhow::anyhow!("install {}: {}", dest.display(), e))?;
+    let installed: PathBuf = match std::fs::rename(&tmp, &dest) {
+        Ok(()) => dest.clone(),
+        Err(_) => {
+            // Windows locks the running image: stage beside it with exact
+            // swap instructions instead of failing opaquely. (Unix rename
+            // replaces running files atomically, so this only triggers on
+            // Windows self-upgrade.)
+            let staged = dir.join(format!("{}.new", asset));
+            std::fs::rename(&tmp, &staged).map_err(|e| {
+                anyhow::anyhow!("install {}: {} (rename blocked — is blitz running from it?)", dest.display(), e)
+            })?;
+            println!(
+                "staged {} (the running binary is locked).\n\
+                 Close BlitzDB processes, then run:\n  \
+                 {} {} \"{}\"",
+                staged.display(),
+                swap_command(),
+                staged.display(),
+                dest.display()
+            );
+            staged
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&dest)
-            .map_err(|e| anyhow::anyhow!("stat {}: {}", dest.display(), e))?
+        let mut perms = std::fs::metadata(&installed)
+            .map_err(|e| anyhow::anyhow!("stat {}: {}", installed.display(), e))?
             .permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(&dest, perms)
-            .map_err(|e| anyhow::anyhow!("chmod {}: {}", dest.display(), e))?;
+        std::fs::set_permissions(&installed, perms)
+            .map_err(|e| anyhow::anyhow!("chmod {}: {}", installed.display(), e))?;
     }
     let _ = std::fs::remove_file(&sums_path);
-    println!("installed {} ({})", dest.display(), &want[..12]);
-    Ok(dest)
+    println!("installed {} ({})", installed.display(), &want[..12]);
+    // PATH wiring is best-effort: the binary works by absolute path
+    // regardless; a wiring failure must never fail the install.
+    match ensure_on_path(&dir) {
+        Ok(true) => print_path_hint(&dir),
+        Ok(false) => {}
+        Err(e) => eprintln!("warning: PATH wiring skipped ({})\n  run with the full path or export PATH manually.", e),
+    }
+    Ok(installed)
+}
+
+#[cfg(windows)]
+fn swap_command() -> &'static str {
+    "move /Y"
+}
+
+#[cfg(not(windows))]
+fn swap_command() -> &'static str {
+    "mv -f"
+}
+
+// -- PATH wiring (per OS) -------------------------------------------------
+
+/// Marker so repeated installs never duplicate entries.
+const PATH_MARKER: &str = "# blitzdb (+blitz)";
+
+/// Render `dir` for shell files (`$HOME`-relative when under home, so
+/// dotfiles stay portable).
+fn display_dir(dir: &PathBuf, home: &str) -> String {
+    let s = dir.to_string_lossy().into_owned();
+    if !home.is_empty() {
+        if let Some(rest) = s.strip_prefix(home) {
+            if rest.starts_with('/') || rest.starts_with('\\') {
+                return format!("$HOME{}", rest);
+            }
+        }
+    }
+    s
+}
+
+fn sh_block(rendered: &str) -> String {
+    format!("{}\nexport PATH=\"{}:$PATH\"\n", PATH_MARKER, rendered)
+}
+
+/// Append `block` to `rcfile` unless the marker is already present.
+/// Creates parent dirs; creates the file when missing.
+fn ensure_blocked_entry(rcfile: &PathBuf, block: &str) -> Result<bool, String> {
+    if rcfile.is_file() {
+        let text =
+            std::fs::read_to_string(rcfile).map_err(|e| format!("read {}: {}", rcfile.display(), e))?;
+        if text.contains(PATH_MARKER) {
+            return Ok(false);
+        }
+    } else if let Some(parent) = rcfile.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(rcfile)
+        .map_err(|e| format!("write {}: {}", rcfile.display(), e))?;
+    writeln!(f, "\n{}", block).map_err(|e| format!("write {}: {}", rcfile.display(), e))?;
+    Ok(true)
+}
+
+/// True when `dir` is already on the (given) PATH value. Separator and
+/// case rules follow the OS (Windows: `;` + case-insensitive).
+fn path_contains(path_var: &str, dir: &str) -> bool {
+    #[cfg(windows)]
+    {
+        path_var.split(';').any(|p| p.eq_ignore_ascii_case(dir))
+    }
+    #[cfg(not(windows))]
+    {
+        // Tilde forms count: shells expand $HOME at use time.
+        path_var.split(':').any(|p| p == dir || p == "$HOME/.blitzdb/bin")
+    }
+}
+
+/// Wire `dir` onto PATH for future shells. Returns true when anything
+/// changed (caller prints the refresh hint). Never fails the install:
+/// errors become warnings at the call site.
+pub fn ensure_on_path(dir: &PathBuf) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        ensure_on_path_windows(dir)
+    }
+    #[cfg(not(windows))]
+    {
+        ensure_on_path_unix(dir)
+    }
+}
+
+#[cfg(not(windows))]
+fn ensure_on_path_unix(dir: &PathBuf) -> Result<bool, String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let rendered = display_dir(dir, &home);
+    let home_path = PathBuf::from(&home);
+    let candidates = [
+        home_path.join(".bashrc"),
+        home_path.join(".zshrc"),
+        home_path.join(".profile"),
+    ];
+    let fish = home_path.join(".config").join("fish").join("config.fish");
+    let mut changed = false;
+    let mut touched_any = false;
+    for rc in &candidates {
+        if rc.is_file() {
+            touched_any = true;
+            changed |= ensure_blocked_entry(rc, &sh_block(&rendered))?;
+        }
+    }
+    if fish.is_file() {
+        touched_any = true;
+        // fish_add_path dedupes by design — safe to ensure unconditionally,
+        // but keep our marker for idempotency + auditability.
+        let block = format!("{}\nfish_add_path {}\n", PATH_MARKER, rendered);
+        changed |= ensure_blocked_entry(&fish, &block)?;
+    }
+    if !touched_any {
+        // Bare container / minimal home: create ~/.profile (POSIX shells
+        // read it; richest default available).
+        changed |= ensure_blocked_entry(&home_path.join(".profile"), &sh_block(&rendered))?;
+    }
+    Ok(changed)
+}
+
+#[cfg(windows)]
+fn ensure_on_path_windows(dir: &PathBuf) -> Result<bool, String> {
+    let dir_s = dir.to_string_lossy().into_owned();
+    let current = user_path_var()?;
+    if path_contains(&current, &dir_s) {
+        return Ok(false);
+    }
+    // powershell.exe ships every supported Windows (setx truncates at
+    // ~1024 chars — never use it for PATH).
+    let script = format!(
+        "[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';{}', 'User')",
+        dir_s.replace('\'', "''")
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .status()
+        .map_err(|e| format!("powershell unavailable: {}", e))?;
+    if !status.success() {
+        return Err("powershell failed to persist PATH".to_string());
+    }
+    Ok(true)
+}
+
+#[cfg(windows)]
+fn user_path_var() -> Result<String, String> {
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command",
+               "[Environment]::GetEnvironmentVariable('Path','User')"])
+        .output()
+        .map_err(|e| format!("powershell unavailable: {}", e))?;
+    if !out.status.success() {
+        return Err("powershell failed to read PATH".to_string());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// What to print so the CURRENT shell picks it up (rc/registry edits only
+/// affect new shells).
+fn print_path_hint(dir: &PathBuf) {
+    #[cfg(windows)]
+    {
+        println!("PATH updated — open a NEW terminal (this shell still uses the old PATH).");
+        let _ = dir;
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        println!(
+            "PATH updated — restart your shell, or run now:\n  export PATH=\"{}:$PATH\"",
+            display_dir(dir, &home)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -229,5 +435,70 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::*;
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("blitz-path-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn profile_entry_is_idempotent() {
+        let home = tmp_home("idempotent");
+        let dir = home.join(".blitzdb").join("bin");
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = home.join(".bashrc");
+        std::fs::write(&rc, "# mine\n").unwrap();
+        assert!(ensure_blocked_entry(&rc, &sh_block("$HOME/.blitzdb/bin")).unwrap());
+        assert!(!ensure_blocked_entry(&rc, &sh_block("$HOME/.blitzdb/bin")).unwrap());
+        let text = std::fs::read_to_string(&rc).unwrap();
+        assert!(text.contains("# mine"));
+        assert_eq!(text.matches(PATH_MARKER).count(), 1);
+        // display_dir relativizes under home.
+        assert_eq!(display_dir(&dir, &home.to_string_lossy()), "$HOME/.blitzdb/bin");
+        assert_eq!(display_dir(&PathBuf::from("/opt/x"), &home.to_string_lossy()), "/opt/x");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn ensure_unix_wires_existing_rc_only() {
+        // HOME override is process-global: run serially-safe via unique home
+        // and restore afterwards (single-threaded test binary assumed here
+        // the same as the rest of this module's tests).
+        let home = tmp_home("unix");
+        std::fs::write(home.join(".bashrc"), "").unwrap();
+        // Point HOME at the sandbox for this call.
+        let old = std::env::var("HOME").unwrap_or_default();
+        unsafe { std::env::set_var("HOME", &home) };
+        let changed = ensure_on_path(&home.join(".blitzdb").join("bin")).unwrap();
+        unsafe { std::env::set_var("HOME", old) };
+        assert!(changed);
+        let text = std::fs::read_to_string(home.join(".bashrc")).unwrap();
+        assert!(text.contains("$HOME/.blitzdb/bin"));
+        assert!(!home.join(".profile").exists(), "must not create files unasked when rcs exist");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn path_contains_rules() {
+        #[cfg(windows)]
+        {
+            assert!(path_contains("C:\\a;C:\\b", "c:\\B"));
+            assert!(!path_contains("C:\\a;C:\\b", "C:\\c"));
+            assert!(!path_contains("", "C:\\c"));
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(path_contains("/a:/b", "/b"));
+            assert!(!path_contains("/a:/b", "/c"));
+            assert!(!path_contains("", "/c"));
+        }
     }
 }

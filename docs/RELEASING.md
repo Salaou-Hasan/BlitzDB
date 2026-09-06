@@ -57,3 +57,7 @@ Manual equivalent per device: download the asset +
 `SHA256SUMS` from the release page, verify
 `sha256sum -c` (Linux) / `shasum -a 256` (macOS) /
 `Get-FileHash` (Windows), then run it.
+
+`install` also wires PATH (idempotent marker block in shell profiles,
+fish included; Windows User environment via PowerShell — never `setx`,
+which truncates). PATH failures warn, never fail the install.

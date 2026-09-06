@@ -36,6 +36,12 @@ blitz upgrade            # latest, replacing the current install
 blitz version            # CLI + protocol compatibility floor
 ```
 
+Install wires itself onto PATH automatically (shell profiles on
+Linux/macOS incl. fish, User environment on Windows — restart the
+terminal, or use the `export` line it prints). Upgrading the binary
+you're currently running stages beside it on Windows (locked image)
+with exact swap instructions instead of failing opaquely.
+
 Unsupported devices (Intel Macs, Linux ARM, …) fail with the supported
 list instead of a 404 puzzle — or build from source (`cargo build -p
 blitz-cli`, Rust 1.70+).
