@@ -1,6 +1,6 @@
 [package]
 name = "blitz-client"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 description = "Reference Rust SDK for BlitzDB: invisible autobatching, auto-idempotency, typed errors"
