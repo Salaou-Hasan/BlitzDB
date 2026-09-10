@@ -159,3 +159,27 @@ jobs:
           if ./target/debug/Blitz status --port 17422; then
             echo "status should have failed" && exit 1
           fi
+
+  source-audit:
+    name: no source-tree runtime deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: banned runtime path patterns
+        run: |
+          # Runtime code must never assume a source checkout. Exempt:
+          # build.rs (build-time), tests/ + *test*.rs (test-only).
+          files=$(git ls-files 'crates/*/src/*.rs' | grep -v -e '/build\.rs$' -e '/tests/' -e 'test.*\.rs$' || true)
+          hits=0
+          for pat in 'CARGO_MANIFEST_DIR' 'current_dir()' '"\.\./'; do
+            matches=""
+            if [ -n "$files" ]; then
+              matches=$(echo "$files" | xargs grep -n -- "$pat" 2>/dev/null | grep -v '^\s*//' || true)
+            fi
+            if [ -n "$matches" ]; then
+              echo "::error::banned runtime path pattern: $pat"
+              echo "$matches" | head -5
+              hits=1
+            fi
+          done
+          [ "$hits" = "0" ]

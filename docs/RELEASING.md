@@ -70,3 +70,6 @@ which truncates). PATH failures warn, never fail the install.
 - [ ] `git tag vX.Y.Z && git push origin vX.Y.Z`, then watch the
       release run green and confirm all four assets + `SHA256SUMS`.
 - [ ] Spot-check one install path live (curl|sh or `blitz install`).
+- [ ] `blitz release-check` passes on each platform artifact (CI runs
+      it automatically per build); source-independence suite
+      (`cargo test -p blitz-cli --test release_independence`) green.

@@ -31,14 +31,22 @@ pub struct InstallArgs {
     pub force: bool,
 }
 
-/// This machine's release asset name, or a clear unsupported-device error.
-pub fn asset_for_this_device() -> Result<&'static str, String> {
+/// Device mapping: `(download asset, installed executable name)`.
+/// Installs expose the canonical `blitz` command on every platform;
+/// platform tags live only in release artifact filenames.
+pub struct DeviceAsset {
+    pub download: &'static str,
+    pub executable: &'static str,
+}
+
+/// This machine's release asset, or a clear unsupported-device error.
+pub fn asset_for_this_device() -> Result<DeviceAsset, String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
     match (os, arch) {
-        ("linux", "x86_64") => Ok("blitz-linux-x64"),
-        ("windows", "x86_64") => Ok("blitz-windows-x64.exe"),
-        ("macos", "aarch64") => Ok("blitz-macos-arm64"),
+        ("linux", "x86_64") => Ok(DeviceAsset { download: "blitz-linux-x64", executable: "blitz" }),
+        ("windows", "x86_64") => Ok(DeviceAsset { download: "blitz-windows-x64.exe", executable: "blitz.exe" }),
+        ("macos", "aarch64") => Ok(DeviceAsset { download: "blitz-macos-arm64", executable: "blitz" }),
         _ => Err(format!(
             "no prebuilt BlitzDB server for {} {}; supported: linux/x86_64, windows/x86_64, macos/aarch64.\n\
              Build from source (cargo build -p blitz-cli) or request a target.",
@@ -123,7 +131,8 @@ fn sha256_file(path: &PathBuf) -> Result<String, String> {
 
 /// Install (or upgrade to) a server release. Returns the installed path.
 pub fn run_install(args: InstallArgs) -> Result<PathBuf> {
-    let asset = asset_for_this_device().map_err(anyhow::Error::msg)?;
+    let device = asset_for_this_device().map_err(anyhow::Error::msg)?;
+    let (asset, exe) = (device.download, device.executable);
     let tag = if args.version.eq_ignore_ascii_case("latest") {
         resolve_latest().map_err(anyhow::Error::msg)?
     } else {
@@ -136,7 +145,7 @@ pub fn run_install(args: InstallArgs) -> Result<PathBuf> {
     };
     std::fs::create_dir_all(&dir)
         .map_err(|e| anyhow::anyhow!("create {}: {}", dir.display(), e))?;
-    let dest = dir.join(asset);
+    let dest = dir.join(exe);
     let base = format!("https://github.com/{}/releases/download/{}/{}", OWNER_REPO, tag, asset);
 
     // Verify checksums FIRST (fail before touching any existing install).
@@ -175,7 +184,7 @@ pub fn run_install(args: InstallArgs) -> Result<PathBuf> {
         }
     }
     println!("downloading {} {} ...", asset, tag);
-    let tmp = dir.join(format!("{}.pending", asset));
+    let tmp = dir.join(format!("{}.pending", exe));
     if let Err(e) = curl_download(&base, &tmp) {
         let _ = std::fs::remove_file(&tmp);
         anyhow::bail!("{}", e);
@@ -197,7 +206,7 @@ pub fn run_install(args: InstallArgs) -> Result<PathBuf> {
             // swap instructions instead of failing opaquely. (Unix rename
             // replaces running files atomically, so this only triggers on
             // Windows self-upgrade.)
-            let staged = dir.join(format!("{}.new", asset));
+            let staged = dir.join(format!("{}.new", exe));
             std::fs::rename(&tmp, &staged).map_err(|e| {
                 anyhow::anyhow!("install {}: {} (rename blocked — is blitz running from it?)", dest.display(), e)
             })?;

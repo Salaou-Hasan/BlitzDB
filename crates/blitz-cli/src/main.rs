@@ -177,6 +177,11 @@ enum Commands {
         #[arg(long)]
         check: bool,
     },
+    /// Validate this binary as a self-contained release artifact.
+    /// Checks version metadata, bundled templates, and a scaffold
+    /// dry-run per template. Exit nonzero on any failure (CI gate).
+    ReleaseCheck,
+
     /// Local development: server + HTTP bridge + procedure hot-reload.
     /// Watches <dir>/blitz/functions/*.json deploy envelopes and redeploys
     /// on save (same tree `blitz generate` reads). In-memory dev defaults;
@@ -447,6 +452,18 @@ async fn main() -> Result<()> {
                 force: true,
             })?;
             println!("upgraded: {}", dest.display());
+        }
+
+        Commands::ReleaseCheck => {
+            let mut failed = 0;
+            for check in compat::release_check() {
+                let mark = if check.pass { "ok" } else { failed += 1; "FAIL" };
+                println!("[{}] {}: {}", mark, check.name, check.detail);
+            }
+            if failed > 0 {
+                std::process::exit(1);
+            }
+            println!("release-check: all green");
         }
 
         Commands::Metrics => {

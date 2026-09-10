@@ -25,10 +25,19 @@ BlitzDB client vX requires BlitzDB server >= 0.1.0 (found S)
 
 ## Template manifests (`blitz.template.json`)
 
-Templates are discovered, never hard-coded: `blitz init` scans template
-directories (default `./templates`, repeatable `--templates`) for
-immediate subdirectories containing the manifest. Malformed manifests
-warn-and-skip (one broken template never hides healthy ones).
+Templates are discovered, never hard-coded — and never from the source
+checkout. Sources, in priority order:
+
+1. Explicit `--templates` dirs (flag order; first source wins on name
+   collisions, with a shadowing warning).
+2. User directory `~/.blitzdb/templates` (convention, never required).
+3. **Bundled officials**, embedded in the binary at build time (sorted,
+   deterministic; a missing bundle fails the BUILD, never the user).
+
+So plain `blitz init` works offline with zero repository access, while
+`blitz init --templates ./mine` behaves exactly as before (backward
+compatible, including multi-dir combining). A remote registry is
+deliberately absent: no silent internet downloads, ever.
 
 ```json
 {

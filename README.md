@@ -72,7 +72,9 @@ blitz generate --check # CI mode: generated bindings must be current
 `blitz init` resolves template ↔ SDK ↔ protocol ↔ server versions
 *before* scaffolding and writes the pins to `blitz.project.json` —
 incompatible combos fail with a readable error, never a broken project.
-Details: `docs/COMPATIBILITY.md`.
+Templates ship **inside the binary** (plus your `~/.blitzdb/templates`
+and explicit `--templates` dirs): no source checkout required, offline
+included. Details: `docs/COMPATIBILITY.md`.
 
 ## SDKs (one protocol, one contract)
 

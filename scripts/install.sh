@@ -26,8 +26,8 @@ command -v curl >/dev/null 2>&1 || die "curl is required (https://curl.se) — o
 os="$(uname -s)"
 arch="$(uname -m)"
 case "$os/$arch" in
-  Linux/x86_64)  ASSET="blitz-linux-x64" ;;
-  Darwin/arm64)  ASSET="blitz-macos-arm64" ;;
+  Linux/x86_64)  ASSET="blitz-linux-x64" ; EXE="blitz" ;;
+  Darwin/arm64)  ASSET="blitz-macos-arm64" ; EXE="blitz" ;;
   *) die "no prebuilt BlitzDB server for $os/$arch; supported: Linux/x86_64, macOS/arm64 (Apple Silicon).
   Intel Macs and Linux ARM: build from source (cargo build -p blitz-cli) or request a target." ;;
 esac
@@ -48,7 +48,7 @@ esac
 BASE="https://github.com/$REPO/releases/download/$TAG"
 mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 
-tmp_bin="$INSTALL_DIR/.$ASSET.pending"
+tmp_bin="$INSTALL_DIR/.$EXE.pending"
 tmp_sums="$INSTALL_DIR/.SHA256SUMS.pending"
 cleanup() { rm -f "$tmp_bin" "$tmp_sums"; }
 trap cleanup EXIT INT TERM
@@ -91,14 +91,14 @@ wire_path() {
 }
 
 # Verified-idempotent: matching checksum means done already.
-if [ -f "$INSTALL_DIR/$ASSET" ]; then
+if [ -f "$INSTALL_DIR/$EXE" ]; then
   if command -v sha256sum >/dev/null 2>&1; then
-    have="$(sha256sum "$INSTALL_DIR/$ASSET" | awk '{print $1}')"
+    have="$(sha256sum "$INSTALL_DIR/$EXE" | awk '{print $1}')"
   else
-    have="$(shasum -a 256 "$INSTALL_DIR/$ASSET" | awk '{print $1}')"
+    have="$(shasum -a 256 "$INSTALL_DIR/$EXE" | awk '{print $1}')"
   fi
   if [ "$have" = "$want" ]; then
-    info "already installed: $INSTALL_DIR/$ASSET (${want%????????????????????????????????}…)"
+    info "already installed: $INSTALL_DIR/$EXE (${want%????????????????????????????????}…)"
     rm -f "$tmp_sums"
     trap - EXIT INT TERM
     wire_path
@@ -125,11 +125,11 @@ if [ -z "${BLITZ_NO_VERIFY:-}" ]; then
   info "checksum ok (${want%????????????????????????????????}…)"
 fi
 
-mv -f "$tmp_bin" "$INSTALL_DIR/$ASSET"
-chmod +x "$INSTALL_DIR/$ASSET"
+mv -f "$tmp_bin" "$INSTALL_DIR/$EXE"
+chmod +x "$INSTALL_DIR/$EXE"
 rm -f "$tmp_sums"
 trap - EXIT INT TERM
-info "installed $INSTALL_DIR/$ASSET"
+info "installed $INSTALL_DIR/$EXE"
 wire_path
 
 info "try it: blitz version"

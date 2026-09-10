@@ -24,6 +24,7 @@ function Info($msg) { Write-Host "blitz install: $msg" }
 $arch = $env:PROCESSOR_ARCHITECTURE
 if ($arch -eq 'AMD64') {
   $Asset = 'blitz-windows-x64.exe'
+  $Exe = 'blitz.exe'
 } else {
   Fail "no prebuilt BlitzDB server for Windows/$arch; supported: Windows/x86_64 (AMD64). Build from source (cargo build -p blitz-cli) or request a target."
 }
@@ -43,7 +44,7 @@ if ($Version -notlike 'v*') { $Tag = "v$Version" } else { $Tag = $Version }
 
 $Base = "https://github.com/$Repo/releases/download/$Tag"
 New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-$tmpBin = Join-Path $InstallDir ".$Asset.pending"
+$tmpBin = Join-Path $InstallDir ".$Exe.pending"
 $SumsFile = Join-Path $InstallDir '.SHA256SUMS.pending'
 try {
   Info "fetching SHA256SUMS for $Tag ..."
@@ -52,7 +53,7 @@ try {
   if (-not $want) { Fail "SHA256SUMS has no entry for $Asset" }
 
   # Verified-idempotent: matching checksum means done already.
-  $dest = Join-Path $InstallDir $Asset
+  $dest = Join-Path $InstallDir $Exe
   if (Test-Path $dest) {
     $have = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
     if ($have -eq $want.ToLower()) {
