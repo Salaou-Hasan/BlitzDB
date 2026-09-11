@@ -4849,7 +4849,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_job_fuel_kill_and_unknown() {
+    // Fuel exhaustion aborts the whole test binary on Windows (wasmtime
+    // trap nounwind — same platform gate as the blitz-jobs fuel tests;
+    // Linux/macOS prove the mapping to FuelExhausted there).
+    #[cfg_attr(target_os = "windows", ignore)]
+    #[tokio::test]
+    async fn test_job_fuel_kill() {
         let server = Arc::new(BlitzServer::new());
         server.start().await.unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4879,6 +4884,16 @@ mod tests {
         assert_eq!(out.get("status"), Some(&Value::String("failed".into())), "got {:?}", out);
         assert!(matches!(out.get("error"), Some(Value::String(e)) if e.contains("fuel")),
             "got {:?}", out);
+    }
+
+    #[tokio::test]
+    async fn test_job_unknown_and_atomic_reject() {
+        let server = Arc::new(BlitzServer::new());
+        server.start().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(Arc::clone(&server), listener));
+        let mut client = Client::connect(addr).await.unwrap();
         // Unknown job id errors honestly.
         let r = client
             .roundtrip(&Request {
