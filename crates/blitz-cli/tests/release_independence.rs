@@ -15,51 +15,21 @@ use std::time::{Duration, Instant};
 
 fn blitz() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_Blitz"));
-    // Scrub build/dev environment: the binary must not read any of it.
-    // (Keep PATH + system essentials so subprocesses and DLL loading work.)
-    let keep_prefixes = ["PATH=", "SYSTEMROOT=", "SYSTEMDRIVE=", "WINDIR=", "TEMP=", "TMP=",
-        "HOME=", "USERPROFILE=", "LANG=", "LC_", "TZ="];
-    let scrubbed: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| {
-            !(k.starts_with("CARGO_") || k.starts_with("RUST"))
-                && (keep_prefixes.iter().any(|p| {
-                    let key = format!("{}=", k);
-                    p.ends_with('=') && key.starts_with(&p[..p.len() - 1]) || k == *p
-                }) || std::env::var_os(k).is_some() && is_essential(k))
-        })
-        .collect();
+    // Scrub exactly the channels by which source-tree paths could leak
+    // (`CARGO_*`, `RUST*`); pass everything else through untouched. (A
+    // prior allowlist revision starved Windows children of `SystemRoot`
+    // and Winsock refused to initialize — WSAEPROVIDERFAILEDINIT. The
+    // denylist proves the same point without touching OS/network needs.)
     cmd.env_clear();
-    for (k, v) in scrubbed {
-        // Re-add only safe essentials (PATH-like + locale + temp).
-        if k == "PATH"
-            || k == "SystemRoot"
-            || k == "SYSTEMROOT"
-            || k == "SYSTEMDRIVE"
-            || k == "WINDIR"
-            || k == "TEMP"
-            || k == "TMP"
-            || k == "HOME"
-            || k == "USERPROFILE"
-            || k.starts_with("LC_")
-            || k == "LANG"
-            || k == "TZ"
-        {
-            cmd.env(k, v);
+    for (k, v) in std::env::vars() {
+        if k == "CARGO" || k.starts_with("CARGO_") || k.starts_with("RUST") {
+            continue;
         }
+        cmd.env(k, v);
     }
     // Unrelated working directory (never the source checkout).
     cmd.current_dir(scratch_root());
     cmd
-}
-
-fn is_essential(k: &str) -> bool {
-    // Windows loader + tooling essentials beyond the explicit list.
-    k == "Path"
-        || k == "SystemDrive"
-        || k == "COMSPEC"
-        || k == "PATHEXT"
-        || k == "NUMBER_OF_PROCESSORS"
-        || k == "OS"
 }
 
 fn scratch_root() -> PathBuf {
