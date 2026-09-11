@@ -1,6 +1,6 @@
 # BlitzDB one-line installer (Windows PowerShell 5.1+).
 #
-#   iwr https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.3/scripts/install.ps1 -useb | iex
+#   iwr https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.4/scripts/install.ps1 -useb | iex
 #
 # Env overrides: $env:BLITZ_VERSION (tag like v0.2.1, or "latest"),
 # $env:BLITZ_DIR (install dir, default $HOME\.blitzdb\bin),

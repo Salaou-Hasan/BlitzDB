@@ -1,6 +1,6 @@
 {
   "name": "@blitzdb/client",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "Reference TypeScript SDK for BlitzDB: invisible autobatching, auto-idempotency, typed errors",
   "type": "module",
   "main": "src/index.ts",

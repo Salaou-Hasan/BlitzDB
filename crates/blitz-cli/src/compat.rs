@@ -749,7 +749,27 @@ pub async fn run_init(args: InitArgs) -> anyhow::Result<()> {
         println!("  advisory minimums recorded in {} (verified: false)", PROJECT_FILE);
     }
     println!("next: run your app against a BlitzDB server (blitz serve).");
+    if !record.verified {
+        if let Some(cmd) = sdk_install_hint(&record.sdk, &chosen.manifest.language) {
+            println!("next: install the SDK, then re-verify versions:");
+            println!("  {}", cmd);
+        }
+    }
     Ok(())
+}
+
+/// Package-manager one-liner per template language (best-effort guidance,
+/// not execution — the developer's toolchain stays theirs).
+fn sdk_install_hint(sdk: &str, language: &str) -> Option<String> {
+    match language.to_ascii_lowercase().as_str() {
+        l if l.contains("typescript") || l.contains("javascript") => {
+            Some(format!("npm install {}", sdk))
+        }
+        l if l.contains("python") => Some(format!("pip install {}", sdk)),
+        l if l.contains("go") => Some(format!("go get {}", sdk)),
+        l if l.contains("rust") => Some(format!("cargo add {}", sdk)),
+        _ => None,
+    }
 }
 
 /// Interactive picker: compatible templates first (with pins previewed),

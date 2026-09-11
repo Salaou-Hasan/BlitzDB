@@ -183,7 +183,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-api"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-auth",
  "blitz-core",
@@ -197,7 +197,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-auth"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "chrono",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-cli"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "blitz-core",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-client"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-protocol",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-cluster"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "chrono",
@@ -257,7 +257,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-core"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "dashmap",
@@ -270,7 +270,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-events"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "blitz-core",
@@ -284,7 +284,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-index"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-types",
@@ -295,7 +295,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-jobs"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "chrono",
@@ -309,7 +309,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-memory"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-types",
@@ -320,7 +320,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-observability"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "thiserror 2.0.20",
@@ -330,7 +330,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-policy"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-auth",
  "blitz-types",
@@ -340,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-protocol"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "bytes",
@@ -352,7 +352,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-query"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-table",
@@ -363,7 +363,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-realtime"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "async-trait",
  "blitz-core",
@@ -377,7 +377,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-replication"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "chrono",
@@ -388,7 +388,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-runtime"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-tx",
@@ -403,7 +403,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-search"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-types",
  "thiserror 2.0.20",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-server"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -452,7 +452,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-snapshot"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-types",
@@ -465,7 +465,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-storage"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bincode",
  "blake3",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-table"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-memory",
@@ -495,7 +495,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-tx"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blitz-core",
  "blitz-table",
@@ -508,7 +508,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-types"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "bytes",
  "chrono",
@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "blitz-wal"
-version = "0.2.3"
+version = "0.2.4"
 dependencies = [
  "blake3",
  "blitz-core",

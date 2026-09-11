@@ -22,12 +22,12 @@ One-liners (checksums verified, PATH wired automatically):
 
 ```bash
 # macOS / Linux
-curl -sSf https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.3/scripts/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.4/scripts/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-iwr https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.3/scripts/install.ps1 -useb | iex
+iwr https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.4/scripts/install.ps1 -useb | iex
 ```
 
 Or pick your device from the release (checksums included):

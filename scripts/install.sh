@@ -1,7 +1,7 @@
 #!/bin/sh
 # BlitzDB one-line installer (macOS / Linux).
 #
-#   curl -sSf https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.3/scripts/install.sh | sh
+#   curl -sSf https://raw.githubusercontent.com/Salaou-Hasan/BlitzDB/v0.2.4/scripts/install.sh | sh
 #
 # Env overrides: BLITZ_VERSION (tag like v0.2.1, or "latest"),
 # BLITZ_DIR (install dir, default ~/.blitzdb/bin), BLITZ_NO_PATH=1
