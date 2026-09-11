@@ -4848,7 +4848,6 @@ mod tests {
         assert_eq!(out.get("result"), Some(&Value::String("hello-jobs".into())));
     }
 
-    #[tokio::test]
     // Fuel exhaustion aborts the whole test binary on Windows (wasmtime
     // trap nounwind — same platform gate as the blitz-jobs fuel tests;
     // Linux/macOS prove the mapping to FuelExhausted there).
