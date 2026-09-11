@@ -470,12 +470,19 @@ mod path_tests {
         let text = std::fs::read_to_string(&rc).unwrap();
         assert!(text.contains("# mine"));
         assert_eq!(text.matches(PATH_MARKER).count(), 1);
-        // display_dir relativizes under home.
-        assert_eq!(display_dir(&dir, &home.to_string_lossy()), "$HOME/.blitzdb/bin");
+        // display_dir relativizes under home (separator follows the OS).
+        let sep = std::path::MAIN_SEPARATOR;
+        assert_eq!(
+            display_dir(&dir, &home.to_string_lossy()),
+            format!("$HOME{0}.blitzdb{0}bin", sep)
+        );
         assert_eq!(display_dir(&PathBuf::from("/opt/x"), &home.to_string_lossy()), "/opt/x");
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    // Unix shell wiring (HOME override + rc files): Windows dispatches to
+    // the registry path instead (covered by path_contains_rules).
+    #[cfg(not(windows))]
     #[test]
     fn ensure_unix_wires_existing_rc_only() {
         // HOME override is process-global: run serially-safe via unique home

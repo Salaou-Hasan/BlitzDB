@@ -70,8 +70,15 @@ blitz init [dir] [--templates DIR]... [--template NAME]
 first and incompatible greyed with reasons); 4. confirm; 5. scaffold
 (copy tree) + write `blitz.project.json` pins.
 
+Bare `blitz init` (no flags, no server) still works: with versions
+unknown, interactive/named picks scaffold with an `UNVERIFIED` warning
+and advisory minimums (`verified: false`, empty `sdk_version`,
+template floors for protocol/server). `--yes` without versions refuses
+instead — non-interactive use must be explicit (flags or `--server`).
+
 `blitz.project.json` records `{template, template_version, sdk,
-sdk_version, protocol, server_min}` — the reproducible audit trail.
+sdk_version, protocol, server_min, verified}` — the reproducible audit
+trail when verified, honest minimums when not.
 
 ## CLI layout note
 

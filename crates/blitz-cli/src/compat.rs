@@ -81,6 +81,12 @@ pub struct ServerReq {
 }
 
 /// What a project pins after successful resolution.
+///
+/// `verified` is true when every side was checked against known versions.
+/// Unverified records (interactive init without version info) carry the
+/// template's MINIMUMS as advisory values and an empty `sdk_version`
+/// (unpinned — the package manager resolves at install). Re-run init
+/// with versions (or `blitz dev` against a live server) to verify.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectRecord {
     pub blitz_project: u32,
@@ -90,6 +96,8 @@ pub struct ProjectRecord {
     pub sdk_version: String,
     pub protocol: u8,
     pub server_min: String,
+    #[serde(default)]
+    pub verified: bool,
 }
 
 /// Versions known at resolve time (CLI flags / local SDK installs / probe).
@@ -381,7 +389,30 @@ pub fn resolve(
         sdk_version: sdk_version.clone(),
         protocol,
         server_min: m.server.min.clone(),
+        verified: true,
     })
+}
+
+/// Whether every version input is present (strict resolution possible).
+pub fn known_complete(known: &KnownVersions) -> bool {
+    !known.sdks.is_empty() && known.server.is_some() && known.protocol.is_some()
+}
+
+/// Advisory record for interactive init without version info: template
+/// minimums, unpinned SDK. Never used non-interactively (CI must be
+/// explicit — silent unverified scaffolding there would rot).
+pub fn unverified_record(template: &DiscoveredTemplate) -> ProjectRecord {
+    let m = &template.manifest;
+    ProjectRecord {
+        blitz_project: 1,
+        template: m.name.clone(),
+        template_version: m.version.clone(),
+        sdk: m.sdk.name.clone(),
+        sdk_version: String::new(),
+        protocol: m.protocol.min,
+        server_min: m.server.min.clone(),
+        verified: false,
+    }
 }
 
 /// User-level template directory (`~/.blitzdb/templates`), scanned
@@ -628,6 +659,11 @@ pub async fn run_init(args: InitArgs) -> anyhow::Result<()> {
         known.protocol = Some(p);
     }
     // Candidate: named template, --yes fast path, or interactive pick.
+    // Versions complete -> strict resolution (mismatches are errors).
+    // Versions missing -> interactive/named use proceeds UNVERIFIED with a
+    // warning (the common fresh-machine case); --yes still demands full
+    // versions (CI must be explicit, never silently unverified).
+    let complete = known_complete(&known);
     let chosen = if let Some(name) = &args.template {
         found
             .iter()
@@ -641,6 +677,13 @@ pub async fn run_init(args: InitArgs) -> anyhow::Result<()> {
             })?
             .clone()
     } else if args.yes {
+        if !complete {
+            anyhow::bail!(
+                "cannot verify compatibility non-interactively: no SDK/server versions known.\n\
+                 Pass --sdk-version name=ver with --server-version X.Y.Z --protocol N,\n\
+                 or --server host:port for a live probe, or pick interactively."
+            );
+        }
         found
             .iter()
             .find(|t| resolve(t, &known, env!("CARGO_PKG_VERSION")).is_ok())
@@ -649,7 +692,7 @@ pub async fn run_init(args: InitArgs) -> anyhow::Result<()> {
             })?
             .clone()
     } else {
-        pick_template(&found, &known)?
+        pick_template(&found, &known, complete)?
     };
     // With a named template or --yes fast path, --yes only skips confirmation.
     if !args.yes {
@@ -667,8 +710,18 @@ pub async fn run_init(args: InitArgs) -> anyhow::Result<()> {
             return Ok(());
         }
     }
-    let record = resolve(&chosen, &known, env!("CARGO_PKG_VERSION"))
-        .map_err(|e| anyhow::anyhow!("incompatible template:\n{}", e))?;
+    let record = if complete {
+        resolve(&chosen, &known, env!("CARGO_PKG_VERSION"))
+            .map_err(|e| anyhow::anyhow!("incompatible template:\n{}", e))?
+    } else {
+        eprintln!(
+            "warning: scaffolding '{}' UNVERIFIED (no SDK/server versions given).\n\
+             Record carries advisory minimums; verify with --server host:port\n\
+             or explicit --sdk-version/--server-version/--protocol.",
+            chosen.manifest.name
+        );
+        unverified_record(&chosen)
+    };
     std::fs::create_dir_all(&args.dir)?;
     write_files(&chosen.files, &args.dir)?;
     std::fs::write(
@@ -681,19 +734,32 @@ pub async fn run_init(args: InitArgs) -> anyhow::Result<()> {
         record.template,
         record.template_version
     );
-    println!("  sdk: {} {}", record.sdk, record.sdk_version);
-    println!("  protocol v{}, server >= {}", record.protocol, record.server_min);
-    println!("  versions pinned in {}", PROJECT_FILE);
+    if record.verified {
+        println!("  sdk: {} {}", record.sdk, record.sdk_version);
+        println!("  protocol v{}, server >= {}", record.protocol, record.server_min);
+        println!("  versions pinned in {}", PROJECT_FILE);
+    } else {
+        println!("  sdk: {} (unpinned — resolves at install)", record.sdk);
+        println!(
+            "  needs: protocol v{}–v{}, server >= {} (verify before shipping)",
+            record.protocol,
+            record.protocol,
+            record.server_min
+        );
+        println!("  advisory minimums recorded in {} (verified: false)", PROJECT_FILE);
+    }
     println!("next: run your app against a BlitzDB server (blitz serve).");
     Ok(())
 }
 
 /// Interactive picker: compatible templates first (with pins previewed),
 /// then incompatible ones greyed with their reason. `--yes` takes the
-/// first compatible without asking.
+/// first compatible without asking. When versions are unknown (`strict`
+/// false), everything lists as unverified-but-selectable instead.
 fn pick_template(
     found: &[DiscoveredTemplate],
     known: &KnownVersions,
+    strict: bool,
 ) -> anyhow::Result<DiscoveredTemplate> {
     let annotated: Vec<(&DiscoveredTemplate, Result<ProjectRecord, String>)> = found
         .iter()
@@ -716,7 +782,7 @@ fn pick_template(
                 rec.protocol,
                 rec.server_min
             ),
-            Err(e) => {
+            Err(e) if strict => {
                 let first = e.lines().next().unwrap_or("");
                 println!(
                     "  {}) {} v{} — {} (INCOMPATIBLE: {})",
@@ -725,6 +791,20 @@ fn pick_template(
                     t.manifest.version,
                     t.manifest.description,
                     first
+                );
+            }
+            Err(_) => {
+                let m = &t.manifest;
+                println!(
+                    "  {}) {} v{} — {} [{} {}, protocol v{}+, server >= {}] (unverified — no versions given)",
+                    i + 1,
+                    t.manifest.name,
+                    t.manifest.version,
+                    t.manifest.description,
+                    m.sdk.name,
+                    m.sdk.range,
+                    m.protocol.min,
+                    m.server.min
                 );
             }
         }
@@ -736,10 +816,11 @@ fn pick_template(
         let mut line = String::new();
         let bytes = std::io::stdin().read_line(&mut line)?;
         if bytes == 0 {
-            // EOF (piped): first compatible or a clear error.
+            // EOF (piped): first compatible — or first overall when
+            // versions are unknown (unverified path scaffolds anyway).
             annotated
                 .iter()
-                .position(|(_, r)| r.is_ok())
+                .position(|(_, r)| r.is_ok() || !strict)
                 .ok_or_else(|| {
                     anyhow::anyhow!("no compatible template (all failed resolution; see list above)")
                 })?
@@ -754,8 +835,10 @@ fn pick_template(
         anyhow::bail!("choice out of range 1..={}", annotated.len());
     }
     let (t, r) = &annotated[n - 1];
-    if let Err(e) = r {
-        anyhow::bail!("that template is incompatible:\n{}", e);
+    if strict {
+        if let Err(e) = r {
+            anyhow::bail!("that template is incompatible:\n{}", e);
+        }
     }
     Ok((*t).clone())
 }
@@ -887,6 +970,73 @@ mod init_tests {
         // the error lists real templates instead of "no templates found".
         assert!(!err.to_string().contains("no templates found"), "got {}", err);
         assert!(err.to_string().contains("not found among"), "got {}", err);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn init_named_without_versions_scaffolds_unverified() {
+        // The fresh-machine case: template named, zero version info.
+        let root = std::env::temp_dir().join(format!("blitz-init-unv-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let custom = root.join("custom");
+        let tpl = custom.join("mine");
+        std::fs::create_dir_all(&tpl).unwrap();
+        std::fs::write(
+            tpl.join(TEMPLATE_MANIFEST),
+            r#"{"manifest":1,"name":"mine","version":"0.1.0","language":"rust",
+                "sdk":{"name":"s","range":">=1.0.0"},"protocol":{"min":2,"max":2},"server":{"min":"0.1.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(tpl.join("note.txt"), "custom").unwrap();
+        run_init(InitArgs {
+            dir: root.join("proj"),
+            template_dirs: vec![custom],
+            template: Some("mine".into()),
+            sdk_version: vec![],
+            server: None,
+            server_version: None,
+            protocol: None,
+            yes: true,
+        })
+        .await
+        .unwrap();
+        let record: ProjectRecord = serde_json::from_str(
+            &std::fs::read_to_string(root.join("proj").join(PROJECT_FILE)).unwrap(),
+        )
+        .unwrap();
+        assert!(!record.verified);
+        assert_eq!(record.sdk_version, "");
+        assert_eq!(record.protocol, 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn init_yes_without_versions_is_guided_error() {
+        // --yes without versions must NOT silently scaffold unverified.
+        let root = std::env::temp_dir().join(format!("blitz-init-yes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let custom = root.join("custom");
+        let tpl = custom.join("mine");
+        std::fs::create_dir_all(&tpl).unwrap();
+        std::fs::write(
+            tpl.join(TEMPLATE_MANIFEST),
+            r#"{"manifest":1,"name":"mine","version":"0.1.0","language":"rust",
+                "sdk":{"name":"s","range":"*"},"protocol":{"min":2,"max":2},"server":{"min":"0.1.0"}}"#,
+        )
+        .unwrap();
+        let err = run_init(InitArgs {
+            dir: root.join("proj"),
+            template_dirs: vec![custom],
+            template: None,
+            sdk_version: vec![],
+            server: None,
+            server_version: None,
+            protocol: None,
+            yes: true,
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--sdk-version"), "got {}", err);
         let _ = std::fs::remove_dir_all(&root);
     }
 
