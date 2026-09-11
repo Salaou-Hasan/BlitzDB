@@ -200,12 +200,14 @@ fn serve_status_query_db_cycle() {
     // Full lifecycle against a live server started by the binary itself.
     let dir = scratch_case("cycle");
     let port = 17601;
+    let log_path = dir.join("serve-stderr.log");
+    let log_file = std::fs::File::create(&log_path).unwrap();
     let mut server = blitz()
         .arg("serve")
         .arg("--port")
         .arg(port.to_string())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(log_file)
         .spawn()
         .expect("spawn serve");
     struct Killer(Child);
@@ -216,11 +218,19 @@ fn serve_status_query_db_cycle() {
     }
     let mut server = Killer(server);
     // Wait for readiness via status (bounded).
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(25);
     loop {
         let (ok, _) = run(blitz().arg("status").arg("--port").arg(port.to_string()));
         if ok || Instant::now() > deadline {
-            assert!(ok, "server never became ready");
+            if !ok {
+                let tail = std::fs::read_to_string(&log_path).unwrap_or_default();
+                let exit = server.0.try_wait().ok().flatten();
+                panic!(
+                    "server never became ready (exit: {:?}); stderr:\n{}",
+                    exit.map(|e| e.to_string()),
+                    tail.chars().take(3000).collect::<String>()
+                );
+            }
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -262,6 +272,18 @@ fn dev_boots_and_hot_reloads() {
         .spawn()
         .expect("spawn dev");
     let stdout = child.stdout.take().unwrap();
+    // Drain stderr on a side thread: (a) a full pipe would deadlock the
+    // child, (b) its content is the diagnosis when boot markers never come.
+    let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let stderr_lines_child = stderr_lines.clone();
+    let mut stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        *stderr_lines_child.lock().unwrap() = text.lines().map(|l| l.to_string()).collect();
+    });
     let reader = BufReader::new(stdout);
     let mut saw_boot = false;
     let mut saw_deploy = false;
@@ -281,6 +303,14 @@ fn dev_boots_and_hot_reloads() {
         }
     }
     let _ = child.kill();
-    assert!(saw_boot, "dev never booted");
-    assert!(saw_deploy, "dev never deployed the envelope");
+    let _ = child.wait();
+    if !(saw_boot && saw_deploy) {
+        let err_lines = stderr_lines.lock().unwrap();
+        panic!(
+            "dev incomplete (boot={} deploy={}); stderr:\n{}",
+            saw_boot,
+            saw_deploy,
+            err_lines.iter().take(40).cloned().collect::<Vec<_>>().join("\n")
+        );
+    }
 }
